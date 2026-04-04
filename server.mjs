@@ -161,8 +161,8 @@ async function fetchDayItems(token, dt) {
     const body = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
     items.push(...(body.data.contents || []));
   }
-  const simplified = items.filter(i => i.taAiYn !== 'Y' && (i.taId || i.taName)).map(i => ({
-    taId: i.taId, taName: i.taName, registerAt: i.registerAt, answerEndAt: i.answerEndAt, starScore: i.starScore,
+  const simplified = items.filter(i => i.taId || i.taName).map(i => ({
+    taId: i.taId, taName: i.taName, admitAt: i.consultationAdmissionAt, answerEndAt: i.answerEndAt, starScore: i.starScore,
   }));
   if (dt < today) diskSet(cacheKey, simplified);
   return simplified;
@@ -181,8 +181,8 @@ async function fetchPerformance(token, startDt, endDt) {
     const k = item.taId || item.taName;
     if (!taMap[k]) taMap[k] = { taId: item.taId, name: item.taName, count: 0, totalMin: 0, totalStar: 0, starCount: 0 };
     taMap[k].count++;
-    if (item.registerAt && item.answerEndAt) {
-      const diff = (new Date(item.answerEndAt) - new Date(item.registerAt)) / 60000;
+    if (item.admitAt && item.answerEndAt) {
+      const diff = (new Date(item.answerEndAt) - new Date(item.admitAt)) / 60000;
       if (diff >= 0) taMap[k].totalMin += diff;
     }
     if (item.starScore != null) {
@@ -191,7 +191,7 @@ async function fetchPerformance(token, startDt, endDt) {
     }
   }
   const taList = Object.values(taMap).map(t => ({
-    taId: t.taId, name: t.taName, count: t.count,
+    taId: t.taId, name: t.name, count: t.count,
     avgMin: t.count > 0 ? Math.round(t.totalMin / t.count) : 0,
     avgStar: t.starCount > 0 ? (t.totalStar / t.starCount).toFixed(1) : '-',
   })).sort((a, b) => b.count - a.count);
