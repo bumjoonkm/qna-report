@@ -1,0 +1,6 @@
+{
+  "name": "qna-report",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "engines": { "node": ">=18" }
+}
