@@ -110,6 +110,50 @@ async function fetchSchedule(token, year, month, branchCode) {
   return { year, month, branchCode, counts };
 }
 
+// ── TA 성과 ──
+
+async function fetchPerformance(token, startDt, endDt) {
+  const first = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  const total = first.data.totalCount;
+  const pages = Math.ceil(total / PAGE_SIZE) || 1;
+  const items = [];
+  for (let p = 1; p <= pages; p++) {
+    const body = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+    items.push(...(body.data.contents || []));
+  }
+  const taMap = {};
+  for (const item of items) {
+    if (item.taAiYn === 'Y') continue; // AI 답변 제외
+    const k = item.taId || item.taName;
+    if (!k) continue;
+    if (!taMap[k]) taMap[k] = { taId: item.taId, name: item.taName, count: 0, totalMin: 0, totalStar: 0, starCount: 0 };
+    taMap[k].count++;
+    if (item.registerAt && item.answerEndAt) {
+      const diff = (new Date(item.answerEndAt) - new Date(item.registerAt)) / 60000;
+      if (diff >= 0) taMap[k].totalMin += diff;
+    }
+    if (item.starScore != null) {
+      taMap[k].totalStar += item.starScore;
+      taMap[k].starCount++;
+    }
+  }
+  const taList = Object.values(taMap).map(t => ({
+    taId: t.taId, name: t.name, count: t.count,
+    avgMin: t.count > 0 ? Math.round(t.totalMin / t.count) : 0,
+    avgStar: t.starCount > 0 ? (t.totalStar / t.starCount).toFixed(1) : '-',
+  })).sort((a, b) => b.count - a.count);
+  const totalCount = taList.reduce((s, t) => s + t.count, 0);
+  const totalMin = taList.reduce((s, t) => s + t.avgMin * t.count, 0);
+  const totalStar = taList.reduce((s, t) => s + (t.avgStar !== '-' ? parseFloat(t.avgStar) * t.count : 0), 0);
+  const starItems = taList.reduce((s, t) => s + (t.avgStar !== '-' ? t.count : 0), 0);
+  return {
+    period: { start: startDt, end: endDt }, totalAnswered: total, taCount: taList.length,
+    avgMin: totalCount > 0 ? Math.round(totalMin / totalCount) : 0,
+    avgStar: starItems > 0 ? (totalStar / starItems).toFixed(1) : '-',
+    taList,
+  };
+}
+
 // ── 라우팅 ──
 
 function readBody(req) {
@@ -161,6 +205,14 @@ const server = createServer(async (req, res) => {
     const branch = url.searchParams.get('branch');
     if (!token || !year || !month || !branch) { json(res, 400, { error: 'token, year, month, branch 필요' }); return; }
     try { json(res, 200, await cached(`schedule:${year}:${month}:${branch}`, () => fetchSchedule(token, year, month, branch))); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/performance') {
+    const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
+    if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
+    try { json(res, 200, await cached(`performance:${start}:${end}`, () => fetchPerformance(token, start, end))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -295,6 +347,7 @@ const HTML = `<!DOCTYPE html>
   <div class="tabs">
     <div class="tab active" onclick="switchTab('report')">답변 시간 초과</div>
     <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄표</div>
+    <div class="tab" onclick="switchTab('perf')">TA 성과</div>
   </div>
 
   <!-- 답변불가 리포트 -->
@@ -319,6 +372,15 @@ const HTML = `<!DOCTYPE html>
       <button class="btn" id="schBtn" onclick="doSchedule()">조회</button>
     </div>
     <div id="scheduleResult"></div>
+  </div>
+
+  <!-- TA 성과 -->
+  <div class="page" id="page-perf">
+    <div class="ctrl">
+      <input type="date" id="perfStart"> <span>~</span> <input type="date" id="perfEnd">
+      <button class="btn" id="perfBtn" onclick="doPerf()">조회</button>
+    </div>
+    <div id="perfResult"></div>
   </div>
 </div>
 
@@ -376,6 +438,8 @@ function initApp() {
   const ym = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
   document.getElementById('startDt').value = ym + '-01';
   document.getElementById('endDt').value = now.toISOString().slice(0, 10);
+  document.getElementById('perfStart').value = ym + '-01';
+  document.getElementById('perfEnd').value = now.toISOString().slice(0, 10);
   schYear = now.getFullYear();
   schMonth = now.getMonth() + 1;
   updateMonthLabel();
@@ -515,6 +579,65 @@ function renderCalendar(data) {
 
   h += '</div>';
   document.getElementById('scheduleResult').innerHTML = h;
+}
+
+// ── TA 성과 ──
+
+let perfSortCol = 'count', perfSortAsc = false, lastPerfData = null;
+
+async function doPerf() {
+  const s = document.getElementById('perfStart').value, e = document.getElementById('perfEnd').value;
+  if (!s || !e || !TOKEN) return;
+  const btn = document.getElementById('perfBtn');
+  btn.disabled = true; btn.textContent = '조회 중...';
+  document.getElementById('perfResult').innerHTML = '<div class="loading">TA 성과 조회 중...</div>';
+  try {
+    const res = await fetch('/api/performance?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
+    if (!res.ok) throw new Error(await res.text());
+    lastPerfData = await res.json();
+    renderPerf(lastPerfData);
+  } catch (err) {
+    document.getElementById('perfResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = '조회';
+}
+
+function sortPerf(col) {
+  if (perfSortCol === col) perfSortAsc = !perfSortAsc;
+  else { perfSortCol = col; perfSortAsc = col === 'name' || col === 'taId'; }
+  if (lastPerfData) renderPerf(lastPerfData);
+}
+
+function renderPerf(d) {
+  if (!d.taList || d.taList.length === 0) {
+    document.getElementById('perfResult').innerHTML = '<div class="loading">해당 기간에 답변 데이터가 없습니다</div>';
+    return;
+  }
+  const list = [...d.taList];
+  list.sort((a, b) => {
+    let va = a[perfSortCol], vb = b[perfSortCol];
+    if (perfSortCol === 'avgStar') { va = va === '-' ? -1 : parseFloat(va); vb = vb === '-' ? -1 : parseFloat(vb); }
+    if (typeof va === 'string') return perfSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+    return perfSortAsc ? va - vb : vb - va;
+  });
+  const arrow = (col) => perfSortCol === col ? (perfSortAsc ? ' ↑' : ' ↓') : '';
+  let h = '<div class="cards"><div class="card"><div class="lb">전체 답변 건수</div><div class="vl">' + d.totalAnswered + '건</div></div>';
+  h += '<div class="card"><div class="lb">평균 소요시간</div><div class="vl">' + d.avgMin + '분</div></div>';
+  h += '<div class="card"><div class="lb">평균 별점</div><div class="vl">' + d.avgStar + '</div></div>';
+  h += '<div class="card"><div class="lb">TA 수</div><div class="vl">' + d.taCount + '명</div></div></div>';
+  h += '<table><thead><tr><th>#</th>';
+  h += '<th style="cursor:pointer" onclick="sortPerf(\'taId\')">TA ID' + arrow('taId') + '</th>';
+  h += '<th style="cursor:pointer" onclick="sortPerf(\'name\')">TA 이름' + arrow('name') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'count\')">답변 건수' + arrow('count') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'avgMin\')">평균 소요시간 (분)' + arrow('avgMin') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'avgStar\')">평균 별점' + arrow('avgStar') + '</th>';
+  h += '</tr></thead><tbody>';
+  list.forEach((ta, i) => {
+    h += '<tr><td>' + (i+1) + '</td><td>' + esc(ta.taId) + '</td><td>' + esc(ta.name) + '</td>';
+    h += '<td class="r">' + ta.count + '</td><td class="r">' + ta.avgMin + '</td><td class="r">' + ta.avgStar + '</td></tr>';
+  });
+  h += '</tbody></table>';
+  document.getElementById('perfResult').innerHTML = h;
 }
 
 // Enter 키
