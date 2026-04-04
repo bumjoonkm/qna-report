@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>답변불가 리포트 — 제한 시간 내 TA 미답변</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; padding: 24px; }
+  .container { max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .period { color: #888; font-size: 14px; margin-bottom: 4px; }
+  .updated { color: #aaa; font-size: 12px; margin-bottom: 24px; }
+  .cards { display: flex; gap: 16px; margin-bottom: 24px; }
+  .card { flex: 1; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card .label { font-size: 13px; color: #888; margin-bottom: 4px; }
+  .card .value { font-size: 28px; font-weight: 700; }
+  .card .value.hl { color: #e53e3e; }
+  .card .sub { font-size: 12px; color: #aaa; margin-top: 4px; }
+  .section { margin-bottom: 24px; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .section h2 { font-size: 14px; font-weight: 600; color: #666; margin-bottom: 12px; }
+  .rb { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  .rb .rn { min-width: 200px; }
+  .rb .bar { height: 18px; border-radius: 4px; min-width: 4px; }
+  .rb .rc { min-width: 40px; text-align: right; color: #888; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  th { background: #fafafa; text-align: left; padding: 12px 16px; font-size: 13px; color: #666; font-weight: 600; border-bottom: 1px solid #eee; }
+  td { padding: 10px 16px; font-size: 14px; border-bottom: 1px solid #f0f0f0; }
+  td.r { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: #fafafa; }
+  .footer { margin-top: 16px; font-size: 12px; color: #bbb; text-align: center; }
+  @media (max-width: 600px) {
+    .cards { flex-direction: column; }
+    .rb .rn { min-width: 120px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>답변불가 리포트</h1>
+  <div class="period">2026-03-01 ~ 2026-03-31</div>
+  <div class="updated">마지막 업데이트: 2026. 4. 4. 오후 8:52:02</div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">전체 답변불가</div>
+      <div class="value">505건</div>
+    </div>
+    <div class="card">
+      <div class="label">제한 시간 내 TA 미답변</div>
+      <div class="value hl">349건</div>
+      <div class="sub">69.1%</div>
+    </div>
+    <div class="card">
+      <div class="label">해당 TA 수</div>
+      <div class="value">139명</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>사유별 분포</h2>
+    <div class="rb"><span class="rn">제한 시간 내 TA 미답변</span><span class="bar" style="width:100%;background:#feb2b2"></span><span class="rc">349</span></div><div class="rb"><span class="rn">질문 불명확으로 답변불가</span><span class="bar" style="width:19%;background:#e2e8f0"></span><span class="rc">67</span></div><div class="rb"><span class="rn">질문 해결 불가로 답변불가</span><span class="bar" style="width:13%;background:#e2e8f0"></span><span class="rc">47</span></div><div class="rb"><span class="rn">기타 사유 (직접입력)</span><span class="bar" style="width:12%;background:#e2e8f0"></span><span class="rc">41</span></div><div class="rb"><span class="rn">사진이 흐려서 질문확인불가</span><span class="bar" style="width:0%;background:#e2e8f0"></span><span class="rc">1</span></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>TA ID</th><th>TA 이름</th><th style="text-align:right">건수</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>25TA103</td><td>김*연</td><td class="r">25</td></tr><tr><td>2</td><td>25TA009</td><td>이*성</td><td class="r">15</td></tr><tr><td>3</td><td>23TA165</td><td>임*영</td><td class="r">12</td></tr><tr><td>4</td><td>26TA251</td><td>이*찬</td><td class="r">8</td></tr><tr><td>5</td><td>25TA213</td><td>박*민</td><td class="r">8</td></tr><tr><td>6</td><td>26TA205</td><td>서*우</td><td class="r">7</td></tr><tr><td>7</td><td>26TA082</td><td>이*찬</td><td class="r">7</td></tr><tr><td>8</td><td>25TA104</td><td>윤*원</td><td class="r">7</td></tr><tr><td>9</td><td>25TA020</td><td>고*우</td><td class="r">6</td></tr><tr><td>10</td><td>25TA243</td><td>김*빈</td><td class="r">6</td></tr><tr><td>11</td><td>24TA231</td><td>김*인</td><td class="r">6</td></tr><tr><td>12</td><td>25TA147</td><td>황*서</td><td class="r">6</td></tr><tr><td>13</td><td>26TA122</td><td>최*호</td><td class="r">6</td></tr><tr><td>14</td><td>25TA216</td><td>이*민</td><td class="r">6</td></tr><tr><td>15</td><td>26TA001</td><td>신*은</td><td class="r">5</td></tr><tr><td>16</td><td>25TA187</td><td>김*현</td><td class="r">5</td></tr><tr><td>17</td><td>24TA147</td><td>성*창</td><td class="r">5</td></tr><tr><td>18</td><td>26TA130</td><td>민*우</td><td class="r">5</td></tr><tr><td>19</td><td>25TA244</td><td>박*규</td><td class="r">5</td></tr><tr><td>20</td><td>25TA170</td><td>권*현</td><td class="r">5</td></tr><tr><td>21</td><td>24TA150</td><td>안*주</td><td class="r">5</td></tr><tr><td>22</td><td>25TA001</td><td>김*훈</td><td class="r">4</td></tr><tr><td>23</td><td>26TA297</td><td>고*영</td><td class="r">4</td></tr><tr><td>24</td><td>24TA143</td><td>양*혁</td><td class="r">4</td></tr><tr><td>25</td><td>25TA316</td><td>이*원</td><td class="r">4</td></tr><tr><td>26</td><td>25TA333</td><td>최*성</td><td class="r">4</td></tr><tr><td>27</td><td>TA1627</td><td>김*원</td><td class="r">4</td></tr><tr><td>28</td><td>26TA050</td><td>강*린</td><td class="r">4</td></tr><tr><td>29</td><td>25TA253</td><td>배*태</td><td class="r">4</td></tr><tr><td>30</td><td>24TA243</td><td>최*헌</td><td class="r">3</td></tr><tr><td>31</td><td>24TA078</td><td>김*진</td><td class="r">3</td></tr><tr><td>32</td><td>aiowl</td><td>아이올(AI OWL)</td><td class="r">3</td></tr><tr><td>33</td><td>26TA185</td><td>전*영</td><td class="r">3</td></tr><tr><td>34</td><td>26TA107</td><td>이*서</td><td class="r">3</td></tr><tr><td>35</td><td>25TA225</td><td>방*서</td><td class="r">3</td></tr><tr><td>36</td><td>25TA357</td><td>이*호</td><td class="r">3</td></tr><tr><td>37</td><td>26TA095</td><td>차*우</td><td class="r">3</td></tr><tr><td>38</td><td>25TA188</td><td>노*욱</td><td class="r">3</td></tr><tr><td>39</td><td>24TA004</td><td>임*영</td><td class="r">3</td></tr><tr><td>40</td><td>26TA284</td><td>고*혁</td><td class="r">3</td></tr><tr><td>41</td><td>23TA160</td><td>임*현</td><td class="r">3</td></tr><tr><td>42</td><td>26TA140</td><td>김*준</td><td class="r">3</td></tr><tr><td>43</td><td>26TA023</td><td>노*성</td><td class="r">2</td></tr><tr><td>44</td><td>26TA005</td><td>김*리</td><td class="r">2</td></tr><tr><td>45</td><td>23ta103</td><td>송*헌</td><td class="r">2</td></tr><tr><td>46</td><td>26TA322</td><td>이*연</td><td class="r">2</td></tr><tr><td>47</td><td>26TA162</td><td>권*재</td><td class="r">2</td></tr><tr><td>48</td><td>25TA230</td><td>김*현</td><td class="r">2</td></tr><tr><td>49</td><td>26TA049</td><td>노*현</td><td class="r">2</td></tr><tr><td>50</td><td>24TA115</td><td>이*석</td><td class="r">2</td></tr><tr><td>51</td><td>25TA045</td><td>김*윤</td><td class="r">2</td></tr><tr><td>52</td><td>26TA264</td><td>구*재</td><td class="r">2</td></tr><tr><td>53</td><td>23TA233</td><td>박*곤</td><td class="r">2</td></tr><tr><td>54</td><td>25TA060</td><td>천*준</td><td class="r">2</td></tr><tr><td>55</td><td>25TA040</td><td>유*</td><td class="r">2</td></tr><tr><td>56</td><td>24TA007</td><td>손*훈</td><td class="r">2</td></tr><tr><td>57</td><td>26TA181</td><td>최*호</td><td class="r">2</td></tr><tr><td>58</td><td>26TA072</td><td>이*나</td><td class="r">2</td></tr><tr><td>59</td><td>26TA116</td><td>강*성</td><td class="r">2</td></tr><tr><td>60</td><td>23TA269</td><td>양*주</td><td class="r">2</td></tr><tr><td>61</td><td>26TA115</td><td>홍*연</td><td class="r">2</td></tr><tr><td>62</td><td>25TA356</td><td>장*윤</td><td class="r">2</td></tr><tr><td>63</td><td>24TA124</td><td>최*훈</td><td class="r">2</td></tr><tr><td>64</td><td>26TA099</td><td>박*언</td><td class="r">1</td></tr><tr><td>65</td><td>25TA389</td><td>박*표</td><td class="r">1</td></tr><tr><td>66</td><td>24TA265</td><td>김*준</td><td class="r">1</td></tr><tr><td>67</td><td>24TA156</td><td>이*혜</td><td class="r">1</td></tr><tr><td>68</td><td>24TA010</td><td>조*성</td><td class="r">1</td></tr><tr><td>69</td><td>25TA369</td><td>김*희</td><td class="r">1</td></tr><tr><td>70</td><td>25TA231</td><td>인*우</td><td class="r">1</td></tr><tr><td>71</td><td>24TA158</td><td>이*현</td><td class="r">1</td></tr><tr><td>72</td><td>26TA306</td><td>김*연</td><td class="r">1</td></tr><tr><td>73</td><td>26TA347</td><td>배*준</td><td class="r">1</td></tr><tr><td>74</td><td>26TA218</td><td>채*찬</td><td class="r">1</td></tr><tr><td>75</td><td>25TA059</td><td>최*우</td><td class="r">1</td></tr><tr><td>76</td><td>25TA385</td><td>유*웅</td><td class="r">1</td></tr><tr><td>77</td><td>26TA327</td><td>정*교</td><td class="r">1</td></tr><tr><td>78</td><td>26TA200</td><td>정*현</td><td class="r">1</td></tr><tr><td>79</td><td>26TA257</td><td>조*준</td><td class="r">1</td></tr><tr><td>80</td><td>25TA042</td><td>김*훈</td><td class="r">1</td></tr><tr><td>81</td><td>26TA114</td><td>김*희</td><td class="r">1</td></tr><tr><td>82</td><td>24TA049</td><td>김*훈</td><td class="r">1</td></tr><tr><td>83</td><td>24TA154</td><td>진*정</td><td class="r">1</td></tr><tr><td>84</td><td>26TA161</td><td>최*우</td><td class="r">1</td></tr><tr><td>85</td><td>26TA020</td><td>김*오</td><td class="r">1</td></tr><tr><td>86</td><td>26TA281</td><td>권*상</td><td class="r">1</td></tr><tr><td>87</td><td>26TA022</td><td>임*현</td><td class="r">1</td></tr><tr><td>88</td><td>26TA008</td><td>박*은</td><td class="r">1</td></tr><tr><td>89</td><td>25TA203</td><td>주*강</td><td class="r">1</td></tr><tr><td>90</td><td>26TA006</td><td>조*정</td><td class="r">1</td></tr><tr><td>91</td><td>25TA226</td><td>임*유</td><td class="r">1</td></tr><tr><td>92</td><td>26TA076</td><td>박*윤</td><td class="r">1</td></tr><tr><td>93</td><td>24TA029</td><td>안*욱</td><td class="r">1</td></tr><tr><td>94</td><td>24TA025</td><td>조*준</td><td class="r">1</td></tr><tr><td>95</td><td>24TA089</td><td>김*리</td><td class="r">1</td></tr><tr><td>96</td><td>26TA061</td><td>문*혁</td><td class="r">1</td></tr><tr><td>97</td><td>26TA121</td><td>오*성</td><td class="r">1</td></tr><tr><td>98</td><td>26TA024</td><td>김*훈</td><td class="r">1</td></tr><tr><td>99</td><td>23TA099</td><td>손*은</td><td class="r">1</td></tr><tr><td>100</td><td>26TA342</td><td>김*주</td><td class="r">1</td></tr><tr><td>101</td><td>25TA220</td><td>임*희</td><td class="r">1</td></tr><tr><td>102</td><td>26TA179</td><td>김*상</td><td class="r">1</td></tr><tr><td>103</td><td>26TA065</td><td>손*찬</td><td class="r">1</td></tr><tr><td>104</td><td>24TA180</td><td>김*현</td><td class="r">1</td></tr><tr><td>105</td><td>26TA275</td><td>박*연</td><td class="r">1</td></tr><tr><td>106</td><td>25TA076</td><td>김*서</td><td class="r">1</td></tr><tr><td>107</td><td>26TA190</td><td>김*민</td><td class="r">1</td></tr><tr><td>108</td><td>26TA042</td><td>황*형</td><td class="r">1</td></tr><tr><td>109</td><td>25TA351</td><td>강*협</td><td class="r">1</td></tr><tr><td>110</td><td>26TA283</td><td>최*우</td><td class="r">1</td></tr><tr><td>111</td><td>26TA036</td><td>장*민</td><td class="r">1</td></tr><tr><td>112</td><td>26TA288</td><td>강*완</td><td class="r">1</td></tr><tr><td>113</td><td>23TA076</td><td>박*성</td><td class="r">1</td></tr><tr><td>114</td><td>26TA117</td><td>강*원</td><td class="r">1</td></tr><tr><td>115</td><td>24TA163</td><td>이*은</td><td class="r">1</td></tr><tr><td>116</td><td>26TA100</td><td>최*영</td><td class="r">1</td></tr><tr><td>117</td><td>25TA073</td><td>정*재</td><td class="r">1</td></tr><tr><td>118</td><td>26TA171</td><td>김*재</td><td class="r">1</td></tr><tr><td>119</td><td>26TA236</td><td>주*준</td><td class="r">1</td></tr><tr><td>120</td><td>25TA328</td><td>김*민</td><td class="r">1</td></tr><tr><td>121</td><td>25TA027</td><td>권*경</td><td class="r">1</td></tr><tr><td>122</td><td>26TA073</td><td>황*준</td><td class="r">1</td></tr><tr><td>123</td><td>25TA085</td><td>백*기</td><td class="r">1</td></tr><tr><td>124</td><td>25TA371</td><td>정*아</td><td class="r">1</td></tr><tr><td>125</td><td>26TA085</td><td>이*경</td><td class="r">1</td></tr><tr><td>126</td><td>26TA267</td><td>송*훈</td><td class="r">1</td></tr><tr><td>127</td><td>26TA241</td><td>강*원</td><td class="r">1</td></tr><tr><td>128</td><td>26TA071</td><td>유*성</td><td class="r">1</td></tr><tr><td>129</td><td>25TA235</td><td>이*석</td><td class="r">1</td></tr><tr><td>130</td><td>26TA362</td><td>이*린</td><td class="r">1</td></tr><tr><td>131</td><td>26TA019</td><td>김*성</td><td class="r">1</td></tr><tr><td>132</td><td>25TA105</td><td>정*수</td><td class="r">1</td></tr><tr><td>133</td><td>24TA079</td><td>정*훈</td><td class="r">1</td></tr><tr><td>134</td><td>25TA034</td><td>이*원</td><td class="r">1</td></tr><tr><td>135</td><td>25TA380</td><td>최*관</td><td class="r">1</td></tr><tr><td>136</td><td>26TA058</td><td>박*현</td><td class="r">1</td></tr><tr><td>137</td><td>26TA324</td><td>조*서</td><td class="r">1</td></tr><tr><td>138</td><td>24TA262</td><td>유*준</td><td class="r">1</td></tr><tr><td>139</td><td>26TA292</td><td>김*연</td><td class="r">1</td></tr>
+    </tbody>
+  </table>
+
+  <div class="footer">이 페이지는 매일 업데이트됩니다.</div>
+</div>
+</body>
+</html>
