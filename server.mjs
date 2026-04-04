@@ -107,19 +107,39 @@ async function fetchSchedule(token, year, month, branchCode) {
     if (!counts[dt]) counts[dt] = {};
     counts[dt][time] = (counts[dt][time] || 0) + 1;
   }
-  return { year, month, branchCode, counts };
+  // 급여 계산
+  const rate = branchCode === 'G1' ? 42000 : 52500;
+  let totalSlots = 0;
+  for (const dt of Object.keys(counts)) {
+    for (const time of Object.keys(counts[dt])) {
+      totalSlots += counts[dt][time];
+    }
+  }
+  return { year, month, branchCode, counts, salary: totalSlots * rate };
+}
+
+async function fetchSalaryAll(token, year, month) {
+  const results = await Promise.all(
+    BRANCHES.map(b => fetchSchedule(token, year, month, b.code).then(r => ({ code: b.code, name: b.name, salary: r.salary })))
+  );
+  const total = results.reduce((s, r) => s + r.salary, 0);
+  return { year, month, branches: results, total };
 }
 
 // ── TA 성과 ──
 
 async function fetchPerformance(token, startDt, endDt) {
-  const first = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
   const total = first.data.totalCount;
   const pages = Math.ceil(total / PAGE_SIZE) || 1;
-  const items = [];
-  for (let p = 1; p <= pages; p++) {
-    const body = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
-    items.push(...(body.data.contents || []));
+  const items = [...(first.data.contents || [])];
+  if (pages > 1) {
+    const rest = await parallelMap(
+      Array.from({ length: pages - 1 }, (_, i) => i + 2),
+      (p) => get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token),
+      CONCURRENCY,
+    );
+    for (const body of rest) items.push(...(body.data.contents || []));
   }
   const taMap = {};
   for (const item of items) {
@@ -205,6 +225,16 @@ const server = createServer(async (req, res) => {
     const branch = url.searchParams.get('branch');
     if (!token || !year || !month || !branch) { json(res, 400, { error: 'token, year, month, branch 필요' }); return; }
     try { json(res, 200, await cached(`schedule:${year}:${month}:${branch}`, () => fetchSchedule(token, year, month, branch))); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/salary') {
+    const token = url.searchParams.get('token');
+    const year = parseInt(url.searchParams.get('year'));
+    const month = parseInt(url.searchParams.get('month'));
+    if (!token || !year || !month) { json(res, 400, { error: 'token, year, month 필요' }); return; }
+    try { json(res, 200, await cached(`salary:${year}:${month}`, () => fetchSalaryAll(token, year, month))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -356,6 +386,7 @@ const HTML = `<!DOCTYPE html>
       <input type="date" id="startDt"> <span>~</span> <input type="date" id="endDt">
       <button class="btn" id="goBtn" onclick="doReport()">조회</button>
       <button class="btn ex" id="exBtn" style="display:none" onclick="doExport()">HTML 내보내기</button>
+      <button class="btn ex" id="exCsvBtn" style="display:none" onclick="exportReportCsv()">엑셀 내보내기</button>
     </div>
     <div id="reportResult"></div>
   </div>
@@ -371,6 +402,7 @@ const HTML = `<!DOCTYPE html>
       </div>
       <button class="btn" id="schBtn" onclick="doSchedule()">조회</button>
     </div>
+    <div id="salaryResult"></div>
     <div id="scheduleResult"></div>
   </div>
 
@@ -379,6 +411,7 @@ const HTML = `<!DOCTYPE html>
     <div class="ctrl">
       <input type="date" id="perfStart"> <span>~</span> <input type="date" id="perfEnd">
       <button class="btn" id="perfBtn" onclick="doPerf()">조회</button>
+      <button class="btn ex" id="perfCsvBtn" style="display:none" onclick="exportPerfCsv()">엑셀 내보내기</button>
     </div>
     <div id="perfResult"></div>
   </div>
@@ -464,6 +497,7 @@ async function doReport() {
   const btn = document.getElementById('goBtn');
   btn.disabled = true; btn.textContent = '조회 중...';
   document.getElementById('exBtn').style.display = 'none';
+  document.getElementById('exCsvBtn').style.display = 'none';
   document.getElementById('reportResult').innerHTML = '<div class="loading">데이터 조회 중... (상세 사유 확인으로 시간이 걸릴 수 있습니다)</div>';
   try {
     const res = await fetch('/api/report?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
@@ -471,6 +505,7 @@ async function doReport() {
     lastReportData = await res.json();
     renderReport(lastReportData);
     document.getElementById('exBtn').style.display = '';
+    document.getElementById('exCsvBtn').style.display = '';
   } catch (err) {
     document.getElementById('reportResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
   }
@@ -527,15 +562,31 @@ async function doSchedule() {
   const btn = document.getElementById('schBtn');
   btn.disabled = true; btn.textContent = '조회 중...';
   document.getElementById('scheduleResult').innerHTML = '<div class="loading">스케줄 조회 중...</div>';
+  document.getElementById('salaryResult').innerHTML = '';
   try {
-    const res = await fetch('/api/schedule?token=' + encodeURIComponent(TOKEN) + '&year=' + schYear + '&month=' + schMonth + '&branch=' + branch);
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
+    const [schRes, salRes] = await Promise.all([
+      fetch('/api/schedule?token=' + encodeURIComponent(TOKEN) + '&year=' + schYear + '&month=' + schMonth + '&branch=' + branch),
+      fetch('/api/salary?token=' + encodeURIComponent(TOKEN) + '&year=' + schYear + '&month=' + schMonth),
+    ]);
+    if (!schRes.ok) throw new Error(await schRes.text());
+    const data = await schRes.json();
     renderCalendar(data);
+    if (salRes.ok) { const sal = await salRes.json(); renderSalary(sal); }
   } catch (err) {
     document.getElementById('scheduleResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
   }
   btn.disabled = false; btn.textContent = '조회';
+}
+
+function renderSalary(sal) {
+  const fmt = (n) => n.toLocaleString('ko-KR');
+  let h = '<div class="cards" style="flex-wrap:wrap">';
+  sal.branches.forEach(b => {
+    h += '<div class="card" style="min-width:120px;flex:0 1 auto"><div class="lb">' + esc(b.name) + '</div><div class="vl" style="font-size:20px">' + fmt(b.salary) + '</div><div class="sm">원</div></div>';
+  });
+  h += '<div class="card" style="min-width:120px;flex:0 1 auto;border:2px solid #333"><div class="lb">합계</div><div class="vl" style="font-size:20px">' + fmt(sal.total) + '</div><div class="sm">원</div></div>';
+  h += '</div>';
+  document.getElementById('salaryResult').innerHTML = h;
 }
 
 function renderCalendar(data) {
@@ -638,6 +689,31 @@ function renderPerf(d) {
   });
   h += '</tbody></table>';
   document.getElementById('perfResult').innerHTML = h;
+}
+
+// ── CSV 내보내기 ──
+
+function downloadCsv(filename, rows) {
+  const bom = '\\uFEFF';
+  const csv = rows.map(r => r.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\\n');
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+}
+
+function exportReportCsv() {
+  if (!lastReportData) return;
+  const d = lastReportData;
+  const rows = [['#', 'TA ID', 'TA 이름', '건수']];
+  d.taList.forEach((ta, i) => rows.push([i + 1, ta.taId, ta.name, ta.count]));
+  downloadCsv('답변시간초과_' + d.period.start + '_' + d.period.end + '.csv', rows);
+}
+
+function exportPerfCsv() {
+  if (!lastPerfData) return;
+  const d = lastPerfData;
+  const rows = [['#', 'TA ID', 'TA 이름', '답변 건수', '평균 소요시간 (분)', '평균 별점']];
+  d.taList.forEach((ta, i) => rows.push([i + 1, ta.taId, ta.name, ta.count, ta.avgMin, ta.avgStar]));
+  downloadCsv('TA성과_' + d.period.start + '_' + d.period.end + '.csv', rows);
 }
 
 // Enter 키
