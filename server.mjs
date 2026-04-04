@@ -581,11 +581,13 @@ async function doSchedule() {
 function renderSalary(sal) {
   const fmt = (n) => n.toLocaleString('ko-KR');
   let h = '<div class="cards" style="flex-wrap:wrap">';
+  h += '<div class="card" style="border:2px solid #333"><div class="lb">TA Meet 급여 합계</div><div class="vl" style="font-size:24px">' + fmt(sal.total) + '원</div>';
+  h += '<div class="sm" style="margin-top:8px">';
   sal.branches.forEach(b => {
-    h += '<div class="card" style="min-width:120px;flex:0 1 auto"><div class="lb">' + esc(b.name) + '</div><div class="vl" style="font-size:20px">' + fmt(b.salary) + '</div><div class="sm">원</div></div>';
+    const rate = b.code === 'G1' ? '42,000' : '52,500';
+    h += esc(b.name) + ' ' + fmt(b.salary) + '원 <span style="color:#aaa">(' + rate + '원/타임)</span><br>';
   });
-  h += '<div class="card" style="min-width:120px;flex:0 1 auto;border:2px solid #333"><div class="lb">합계</div><div class="vl" style="font-size:20px">' + fmt(sal.total) + '</div><div class="sm">원</div></div>';
-  h += '</div>';
+  h += '</div></div></div>';
   document.getElementById('salaryResult').innerHTML = h;
 }
 
@@ -647,6 +649,7 @@ async function doPerf() {
     if (!res.ok) throw new Error(await res.text());
     lastPerfData = await res.json();
     renderPerf(lastPerfData);
+    document.getElementById('perfCsvBtn').style.display = '';
   } catch (err) {
     document.getElementById('perfResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
   }
