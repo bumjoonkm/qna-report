@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: qna-report
+    runtime: node
+    plan: free
+    branch: main
+    buildCommand: ""
+    startCommand: node server.mjs
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
