@@ -285,8 +285,8 @@ const HTML = `<!DOCTYPE html>
 <!-- 앱 -->
 <div class="app" id="appView">
   <div class="tabs">
-    <div class="tab active" onclick="switchTab('report')">답변불가 리포트</div>
-    <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄</div>
+    <div class="tab active" onclick="switchTab('report')">답변 시간 초과</div>
+    <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄표</div>
   </div>
 
   <!-- 답변불가 리포트 -->
