@@ -4,6 +4,14 @@ const API = 'https://qna-admin-api.hiconsysvc.com';
 const PORT = process.env.PORT || 3000;
 const PAGE_SIZE = 100;
 const CONCURRENCY = 20;
+const CACHE_TTL = 10 * 60 * 1000; // 10분
+
+const cache = new Map();
+function cached(key, fn) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_TTL) return Promise.resolve(hit.data);
+  return fn().then(data => { cache.set(key, { data, ts: Date.now() }); return data; });
+}
 
 const BRANCHES = [
   { code: 'Z1', name: 'N관' },
@@ -141,7 +149,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/report') {
     const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
     if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
-    try { json(res, 200, await fetchReport(token, start, end)); }
+    try { json(res, 200, await cached(`report:${start}:${end}`, () => fetchReport(token, start, end))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -152,7 +160,7 @@ const server = createServer(async (req, res) => {
     const month = parseInt(url.searchParams.get('month'));
     const branch = url.searchParams.get('branch');
     if (!token || !year || !month || !branch) { json(res, 400, { error: 'token, year, month, branch 필요' }); return; }
-    try { json(res, 200, await fetchSchedule(token, year, month, branch)); }
+    try { json(res, 200, await cached(`schedule:${year}:${month}:${branch}`, () => fetchSchedule(token, year, month, branch))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
