@@ -135,6 +135,13 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/ip') {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const d = await r.json();
+    json(res, 200, d);
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not Found');
 });
