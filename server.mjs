@@ -38,10 +38,13 @@ async function post(path, body) {
   return res.json();
 }
 
-async function get(path, token) {
-  const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`API ${res.status}`);
-  return res.json();
+async function get(path, token, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.ok) return res.json();
+    if (res.status === 500 && i < retries - 1) { await new Promise(r => setTimeout(r, 1000 * (i + 1))); continue; }
+    throw new Error(`API ${res.status}`);
+  }
 }
 
 async function parallelMap(arr, fn, concurrency) {
@@ -137,7 +140,7 @@ async function fetchPerformance(token, startDt, endDt) {
     const rest = await parallelMap(
       Array.from({ length: pages - 1 }, (_, i) => i + 2),
       (p) => get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token),
-      CONCURRENCY,
+      5,
     );
     for (const body of rest) items.push(...(body.data.contents || []));
   }
