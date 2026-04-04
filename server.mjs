@@ -1,16 +1,30 @@
 import { createServer } from 'http';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 
 const API = 'https://qna-admin-api.hiconsysvc.com';
 const PORT = process.env.PORT || 3000;
 const PAGE_SIZE = 100;
 const CONCURRENCY = 20;
 const CACHE_TTL = 10 * 60 * 1000; // 10분
+const CACHE_DIR = '/tmp/qna-cache';
 
+// ── 인메모리 캐시 (단기) ──
 const cache = new Map();
 function cached(key, fn) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < CACHE_TTL) return Promise.resolve(hit.data);
   return fn().then(data => { cache.set(key, { data, ts: Date.now() }); return data; });
+}
+
+// ── 디스크 캐시 (영구, 과거 데이터용) ──
+if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+function diskGet(key) {
+  const p = `${CACHE_DIR}/${key}.json`;
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
+}
+function diskSet(key, data) {
+  try { writeFileSync(`${CACHE_DIR}/${key}.json`, JSON.stringify(data)); } catch {}
 }
 
 const BRANCHES = [
@@ -131,24 +145,40 @@ async function fetchSalaryAll(token, year, month) {
 
 // ── TA 성과 ──
 
-async function fetchPerformance(token, startDt, endDt) {
-  const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
-  const total = first.data.totalCount;
-  const pages = Math.ceil(total / PAGE_SIZE) || 1;
-  const items = [...(first.data.contents || [])];
-  if (pages > 1) {
-    const rest = await parallelMap(
-      Array.from({ length: pages - 1 }, (_, i) => i + 2),
-      (p) => get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${startDt}&endDt=${endDt}&questionStatusCommonCode=QA120004&searchType=taName`, token),
-      5,
-    );
-    for (const body of rest) items.push(...(body.data.contents || []));
+// 하루치 데이터 가져오기 (디스크 캐시 활용)
+async function fetchDayItems(token, dt) {
+  const today = new Date().toISOString().slice(0, 10);
+  const cacheKey = `perf-${dt}`;
+  if (dt < today) {
+    const cached = diskGet(cacheKey);
+    if (cached) return cached;
   }
+  const items = [];
+  const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  items.push(...(first.data.contents || []));
+  const pages = Math.ceil((first.data.totalCount || 0) / PAGE_SIZE);
+  for (let p = 2; p <= pages; p++) {
+    const body = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+    items.push(...(body.data.contents || []));
+  }
+  const simplified = items.filter(i => i.taAiYn !== 'Y' && (i.taId || i.taName)).map(i => ({
+    taId: i.taId, taName: i.taName, registerAt: i.registerAt, answerEndAt: i.answerEndAt, starScore: i.starScore,
+  }));
+  if (dt < today) diskSet(cacheKey, simplified);
+  return simplified;
+}
+
+// 날짜 범위를 일별로 분할해서 병렬 조회 (과거는 캐시 히트, 빠름)
+async function fetchPerformance(token, startDt, endDt) {
+  const dates = [];
+  for (let d = new Date(startDt); d <= new Date(endDt); d.setDate(d.getDate() + 1)) {
+    dates.push(d.toISOString().slice(0, 10));
+  }
+  const dayResults = await parallelMap(dates, (dt) => fetchDayItems(token, dt), 3);
+  const items = dayResults.flat();
   const taMap = {};
   for (const item of items) {
-    if (item.taAiYn === 'Y') continue; // AI 답변 제외
     const k = item.taId || item.taName;
-    if (!k) continue;
     if (!taMap[k]) taMap[k] = { taId: item.taId, name: item.taName, count: 0, totalMin: 0, totalStar: 0, starCount: 0 };
     taMap[k].count++;
     if (item.registerAt && item.answerEndAt) {
@@ -161,7 +191,7 @@ async function fetchPerformance(token, startDt, endDt) {
     }
   }
   const taList = Object.values(taMap).map(t => ({
-    taId: t.taId, name: t.name, count: t.count,
+    taId: t.taId, name: t.taName, count: t.count,
     avgMin: t.count > 0 ? Math.round(t.totalMin / t.count) : 0,
     avgStar: t.starCount > 0 ? (t.totalStar / t.starCount).toFixed(1) : '-',
   })).sort((a, b) => b.count - a.count);
@@ -170,7 +200,7 @@ async function fetchPerformance(token, startDt, endDt) {
   const totalStar = taList.reduce((s, t) => s + (t.avgStar !== '-' ? parseFloat(t.avgStar) * t.count : 0), 0);
   const starItems = taList.reduce((s, t) => s + (t.avgStar !== '-' ? t.count : 0), 0);
   return {
-    period: { start: startDt, end: endDt }, totalAnswered: total, taCount: taList.length,
+    period: { start: startDt, end: endDt }, totalAnswered: items.length, taCount: taList.length,
     avgMin: totalCount > 0 ? Math.round(totalMin / totalCount) : 0,
     avgStar: starItems > 0 ? (totalStar / starItems).toFixed(1) : '-',
     taList,
