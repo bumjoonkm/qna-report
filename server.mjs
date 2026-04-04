@@ -626,11 +626,11 @@ function renderPerf(d) {
   h += '<div class="card"><div class="lb">평균 별점</div><div class="vl">' + d.avgStar + '</div></div>';
   h += '<div class="card"><div class="lb">TA 수</div><div class="vl">' + d.taCount + '명</div></div></div>';
   h += '<table><thead><tr><th>#</th>';
-  h += '<th style="cursor:pointer" onclick="sortPerf(\'taId\')">TA ID' + arrow('taId') + '</th>';
-  h += '<th style="cursor:pointer" onclick="sortPerf(\'name\')">TA 이름' + arrow('name') + '</th>';
-  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'count\')">답변 건수' + arrow('count') + '</th>';
-  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'avgMin\')">평균 소요시간 (분)' + arrow('avgMin') + '</th>';
-  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(\'avgStar\')">평균 별점' + arrow('avgStar') + '</th>';
+  h += '<th style="cursor:pointer" onclick="sortPerf(&quot;taId&quot;)">TA ID' + arrow('taId') + '</th>';
+  h += '<th style="cursor:pointer" onclick="sortPerf(&quot;name&quot;)">TA 이름' + arrow('name') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(&quot;count&quot;)">답변 건수' + arrow('count') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(&quot;avgMin&quot;)">평균 소요시간 (분)' + arrow('avgMin') + '</th>';
+  h += '<th style="cursor:pointer;text-align:right" onclick="sortPerf(&quot;avgStar&quot;)">평균 별점' + arrow('avgStar') + '</th>';
   h += '</tr></thead><tbody>';
   list.forEach((ta, i) => {
     h += '<tr><td>' + (i+1) + '</td><td>' + esc(ta.taId) + '</td><td>' + esc(ta.name) + '</td>';
