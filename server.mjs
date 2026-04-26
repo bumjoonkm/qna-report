@@ -57,18 +57,16 @@ function todayLocalDt() {
   return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
 }
 
-// 모든 구간의 일수가 같도록 floor(totalDays / n)일씩 균등 분할. 나머지는 버림.
-function splitPeriod(startDt, endDt, n) {
+// startDt부터 X일씩 자르기. 마지막 미완성 구간(< X일)은 버림.
+function splitPeriodByDays(startDt, endDt, daysPerBucket) {
   const startDays = dtToDays(startDt);
   const endDays = dtToDays(endDt);
-  const totalDays = endDays - startDays + 1;
-  const segLen = Math.floor(totalDays / n);
-  if (segLen < 1) return [];
+  if (daysPerBucket < 1) return [];
   const out = [];
-  for (let i = 0; i < n; i++) {
-    const segStart = startDays + i * segLen;
-    const segEnd = segStart + segLen - 1;
-    out.push({ start: daysToDt(segStart), end: daysToDt(segEnd) });
+  let cursor = startDays;
+  while (cursor + daysPerBucket - 1 <= endDays) {
+    out.push({ start: daysToDt(cursor), end: daysToDt(cursor + daysPerBucket - 1) });
+    cursor += daysPerBucket;
   }
   return out;
 }
@@ -256,7 +254,7 @@ async function fetchPerformance(token, startDt, endDt) {
 
 // ── AI 현황 보고 ──
 
-async function fetchAiStatus(token, monthA, monthB, n) {
+async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
   const refYear = parseInt(monthA.split('-')[0]);
   const aMonth = parseInt(monthA.split('-')[1]);
   const bMonth = parseInt(monthB.split('-')[1]);
@@ -266,7 +264,7 @@ async function fetchAiStatus(token, monthA, monthB, n) {
   const today = todayLocalDt();
   const refEnd = monthEnd > today ? today : monthEnd;
 
-  const periodsRef = splitPeriod(refStart, refEnd, n);
+  const periodsRef = splitPeriodByDays(refStart, refEnd, daysPerBucket);
   const periodsPrev = shiftYearTo(periodsRef, refYear - 1);
 
   const allDates = new Set();
@@ -379,9 +377,9 @@ const server = createServer(async (req, res) => {
     const token = url.searchParams.get('token');
     const startMonth = url.searchParams.get('start');
     const endMonth = url.searchParams.get('end');
-    const n = parseInt(url.searchParams.get('n'));
-    if (!token || !startMonth || !endMonth || !n || n < 1) { json(res, 400, { error: 'token, start, end, n 필요' }); return; }
-    try { json(res, 200, await cached(`aistatus:${startMonth}:${endMonth}:${n}`, () => fetchAiStatus(token, startMonth, endMonth, n))); }
+    const days = parseInt(url.searchParams.get('days'));
+    if (!token || !startMonth || !endMonth || !days || days < 1) { json(res, 400, { error: 'token, start, end, days 필요' }); return; }
+    try { json(res, 200, await cached(`aistatus:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -563,7 +561,7 @@ const HTML = `<!DOCTYPE html>
     <div class="ctrl">
       <select id="aiMonthA"></select> <span>월부터</span>
       <select id="aiMonthB"></select> <span>월까지</span>
-      <input type="number" id="aiSplit" min="1" max="12" value="3" style="width:60px"> <span>등분</span>
+      <input type="number" id="aiDays" min="1" max="365" value="7" style="width:60px"> <span>일 간격</span>
       <button class="btn" id="aiBtn" onclick="doAiStatus()">조회</button>
     </div>
     <div class="section" style="padding:24px"><canvas id="aiChart" height="120"></canvas></div>
@@ -918,19 +916,19 @@ async function doAiStatus() {
   const refYear = new Date().getFullYear();
   const A = parseInt(document.getElementById('aiMonthA').value);
   const B = parseInt(document.getElementById('aiMonthB').value);
-  const N = parseInt(document.getElementById('aiSplit').value);
-  if (!A || !B || !N || A > B || N < 1) { alert('A월 ≤ B월, N ≥ 1'); return; }
+  const days = parseInt(document.getElementById('aiDays').value);
+  if (!A || !B || !days || A > B || days < 1) { alert('A월 ≤ B월, X(일 간격) ≥ 1'); return; }
   const start = refYear + '-' + String(A).padStart(2, '0');
   const end = refYear + '-' + String(B).padStart(2, '0');
   const btn = document.getElementById('aiBtn');
   btn.disabled = true;
   btn.textContent = '조회 중... (최초 조회는 시간이 걸릴 수 있어요)';
   try {
-    const res = await fetch('/api/ai-status?token=' + encodeURIComponent(TOKEN) + '&start=' + start + '&end=' + end + '&n=' + N);
+    const res = await fetch('/api/ai-status?token=' + encodeURIComponent(TOKEN) + '&start=' + start + '&end=' + end + '&days=' + days);
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     if (!data.periods || data.periods.length === 0) {
-      alert('해당 기간에 데이터가 없습니다 (미래 기간이거나 N이 총 일수보다 큼)');
+      alert('표시할 완전한 구간이 없습니다 (X일 간격이 총 일수보다 크거나 미래 기간)');
     } else {
       renderAiChart(data);
     }
