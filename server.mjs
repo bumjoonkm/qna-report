@@ -36,6 +36,53 @@ const BRANCHES = [
   { code: 'G1', name: '기숙관' },
 ];
 
+const AI_TA_IDS = new Set(['aiowl']);
+
+function lastDayOfMonth(year, month) {
+  return new Date(year, month, 0).getDate();
+}
+
+function dtToDays(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+function daysToDt(days) {
+  const d = new Date(days * 86400000);
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+
+function todayLocalDt() {
+  const n = new Date();
+  return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
+}
+
+// 모든 구간의 일수가 같도록 floor(totalDays / n)일씩 균등 분할. 나머지는 버림.
+function splitPeriod(startDt, endDt, n) {
+  const startDays = dtToDays(startDt);
+  const endDays = dtToDays(endDt);
+  const totalDays = endDays - startDays + 1;
+  const segLen = Math.floor(totalDays / n);
+  if (segLen < 1) return [];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const segStart = startDays + i * segLen;
+    const segEnd = segStart + segLen - 1;
+    out.push({ start: daysToDt(segStart), end: daysToDt(segEnd) });
+  }
+  return out;
+}
+
+function shiftDate(dt, targetYear) {
+  const [, m, d] = dt.split('-').map(Number);
+  const last = lastDayOfMonth(targetYear, m);
+  return `${targetYear}-${String(m).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
+}
+
+function shiftYearTo(periodArr, targetYear) {
+  return periodArr.map(p => ({ start: shiftDate(p.start, targetYear), end: shiftDate(p.end, targetYear) }));
+}
+
 // ── API 헬퍼 ──
 
 async function post(path, body) {
@@ -207,6 +254,54 @@ async function fetchPerformance(token, startDt, endDt) {
   };
 }
 
+// ── AI 현황 보고 ──
+
+async function fetchAiStatus(token, monthA, monthB, n) {
+  const refYear = parseInt(monthA.split('-')[0]);
+  const aMonth = parseInt(monthA.split('-')[1]);
+  const bMonth = parseInt(monthB.split('-')[1]);
+  const refStart = `${refYear}-${String(aMonth).padStart(2, '0')}-01`;
+  const monthEnd = `${refYear}-${String(bMonth).padStart(2, '0')}-${String(lastDayOfMonth(refYear, bMonth)).padStart(2, '0')}`;
+  // B월 마지막날이 미래면 오늘로 클램프 (refYear == 올해일 때만 의미 있음)
+  const today = todayLocalDt();
+  const refEnd = monthEnd > today ? today : monthEnd;
+
+  const periodsRef = splitPeriod(refStart, refEnd, n);
+  const periodsPrev = shiftYearTo(periodsRef, refYear - 1);
+
+  const allDates = new Set();
+  [...periodsRef, ...periodsPrev].forEach(p => {
+    const sd = dtToDays(p.start), ed = dtToDays(p.end);
+    for (let day = sd; day <= ed; day++) allDates.add(daysToDt(day));
+  });
+
+  const dayMap = {};
+  await parallelMap([...allDates], async (dt) => { dayMap[dt] = await fetchDayItems(token, dt); }, 3);
+
+  const isAI = (item) => AI_TA_IDS.has(item.taId);
+  const sumRange = (period, predicate) => {
+    let total = 0;
+    const sd = dtToDays(period.start), ed = dtToDays(period.end);
+    for (let day = sd; day <= ed; day++) {
+      total += (dayMap[daysToDt(day)] || []).filter(predicate).length;
+    }
+    return total;
+  };
+
+  const periods = periodsRef.map((pRef, i) => {
+    const pPrev = periodsPrev[i];
+    return {
+      labelRef: `${pRef.start} ~ ${pRef.end}`,
+      labelPrev: `${pPrev.start} ~ ${pPrev.end}`,
+      yPrev_human: sumRange(pPrev, x => !isAI(x)),
+      yRef_human: sumRange(pRef, x => !isAI(x)),
+      yRef_ai: sumRange(pRef, x => isAI(x)),
+    };
+  });
+
+  return { refYear, prevYear: refYear - 1, periods };
+}
+
 // ── 라우팅 ──
 
 function readBody(req) {
@@ -280,6 +375,17 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/ai-status') {
+    const token = url.searchParams.get('token');
+    const startMonth = url.searchParams.get('start');
+    const endMonth = url.searchParams.get('end');
+    const n = parseInt(url.searchParams.get('n'));
+    if (!token || !startMonth || !endMonth || !n || n < 1) { json(res, 400, { error: 'token, start, end, n 필요' }); return; }
+    try { json(res, 200, await cached(`aistatus:${startMonth}:${endMonth}:${n}`, () => fetchAiStatus(token, startMonth, endMonth, n))); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not Found');
 });
@@ -292,6 +398,8 @@ const HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TA 관리 도구</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; min-height: 100vh; }
@@ -411,6 +519,7 @@ const HTML = `<!DOCTYPE html>
     <div class="tab active" onclick="switchTab('report')">답변 시간 초과</div>
     <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄표</div>
     <div class="tab" onclick="switchTab('perf')">TA 성과</div>
+    <div class="tab" onclick="switchTab('ai')">AI 현황 보고</div>
   </div>
 
   <!-- 답변불가 리포트 -->
@@ -447,6 +556,17 @@ const HTML = `<!DOCTYPE html>
       <button class="btn ex" id="perfCsvBtn" style="display:none" onclick="exportPerfCsv()">엑셀 내보내기</button>
     </div>
     <div id="perfResult"></div>
+  </div>
+
+  <!-- AI 현황 보고 -->
+  <div class="page" id="page-ai">
+    <div class="ctrl">
+      <select id="aiMonthA"></select> <span>월부터</span>
+      <select id="aiMonthB"></select> <span>월까지</span>
+      <input type="number" id="aiSplit" min="1" max="12" value="3" style="width:60px"> <span>등분</span>
+      <button class="btn" id="aiBtn" onclick="doAiStatus()">조회</button>
+    </div>
+    <div class="section" style="padding:24px"><canvas id="aiChart" height="120"></canvas></div>
   </div>
 </div>
 
@@ -509,6 +629,7 @@ function initApp() {
   schYear = now.getFullYear();
   schMonth = now.getMonth() + 1;
   updateMonthLabel();
+  initAiSelects();
 }
 
 // ── 탭 ──
@@ -750,6 +871,130 @@ function exportPerfCsv() {
   const rows = [['#', 'TA ID', 'TA 이름', '답변 건수', '평균 소요시간 (분)', '평균 별점']];
   d.taList.forEach((ta, i) => rows.push([i + 1, ta.taId, ta.name, ta.count, ta.avgMin, ta.avgStar]));
   downloadCsv('TA성과_' + d.period.start + '_' + d.period.end + '.csv', rows);
+}
+
+// ── AI 현황 보고 ──
+
+let aiChartInstance = null;
+
+const stackTotalsPlugin = {
+  id: 'stackTotals',
+  afterDatasetsDraw(chart) {
+    const { ctx, data } = chart;
+    ctx.save();
+    ctx.fillStyle = '#D9534F';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    data.labels.forEach((_, i) => {
+      ['gPrev', 'gRef'].forEach(stack => {
+        const datasets = data.datasets.filter(d => d.stack === stack);
+        const total = datasets.reduce((s, d) => s + (d.data[i] || 0), 0);
+        if (total === 0) return;
+        const lastDs = datasets[datasets.length - 1];
+        const dsIdx = data.datasets.indexOf(lastDs);
+        const meta = chart.getDatasetMeta(dsIdx);
+        const bar = meta.data[i];
+        ctx.fillText('총 ' + total.toLocaleString() + '건', bar.x, bar.y - 6);
+      });
+    });
+    ctx.restore();
+  }
+};
+
+function initAiSelects() {
+  const a = document.getElementById('aiMonthA'), b = document.getElementById('aiMonthB');
+  if (!a || !b || a.options.length > 0) return;
+  for (let m = 1; m <= 12; m++) {
+    a.insertAdjacentHTML('beforeend', '<option value="' + m + '">' + m + '월</option>');
+    b.insertAdjacentHTML('beforeend', '<option value="' + m + '">' + m + '월</option>');
+  }
+  const cur = new Date().getMonth() + 1;
+  a.value = cur;
+  b.value = cur;
+}
+
+async function doAiStatus() {
+  if (!TOKEN) return;
+  const refYear = new Date().getFullYear();
+  const A = parseInt(document.getElementById('aiMonthA').value);
+  const B = parseInt(document.getElementById('aiMonthB').value);
+  const N = parseInt(document.getElementById('aiSplit').value);
+  if (!A || !B || !N || A > B || N < 1) { alert('A월 ≤ B월, N ≥ 1'); return; }
+  const start = refYear + '-' + String(A).padStart(2, '0');
+  const end = refYear + '-' + String(B).padStart(2, '0');
+  const btn = document.getElementById('aiBtn');
+  btn.disabled = true;
+  btn.textContent = '조회 중... (최초 조회는 시간이 걸릴 수 있어요)';
+  try {
+    const res = await fetch('/api/ai-status?token=' + encodeURIComponent(TOKEN) + '&start=' + start + '&end=' + end + '&n=' + N);
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (!data.periods || data.periods.length === 0) {
+      alert('해당 기간에 데이터가 없습니다 (미래 기간이거나 N이 총 일수보다 큼)');
+    } else {
+      renderAiChart(data);
+    }
+  } catch (err) { alert('오류: ' + err.message); }
+  btn.disabled = false;
+  btn.textContent = '조회';
+}
+
+function renderAiChart(data) {
+  const refYear = data.refYear;
+  const prevYear = data.prevYear;
+  const periods = data.periods;
+  const labels = periods.map(p => {
+    const parts = p.labelRef.split(' ~ ');
+    return parts.map(s => s.slice(5).replace('-', '/')).join(' ~ ');
+  });
+  const refSuffix = String(refYear).slice(2);
+  const prevSuffix = String(prevYear).slice(2);
+  const datasets = [
+    { label: prevSuffix + '년 인간 TA', backgroundColor: '#F1BF42', stack: 'gPrev',
+      data: periods.map(p => p.yPrev_human) },
+    { label: refSuffix + '년 인간 TA', backgroundColor: '#D9534F', stack: 'gRef',
+      data: periods.map(p => p.yRef_human) },
+    { label: refSuffix + '년 AI TA (아이올)', backgroundColor: '#4A90E2', stack: 'gRef',
+      data: periods.map(p => p.yRef_ai) },
+  ];
+  if (aiChartInstance) aiChartInstance.destroy();
+  const ctx = document.getElementById('aiChart').getContext('2d');
+  aiChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: labels, datasets: datasets },
+    options: {
+      responsive: true,
+      layout: { padding: { top: 28 } },
+      plugins: {
+        legend: { position: 'top' },
+        title: { display: true, text: prevSuffix + '년 vs ' + refSuffix + '년 해결완료 답변 수 비교 (질문 상태=문제해결)' },
+        tooltip: {
+          callbacks: {
+            title: (items) => {
+              const i = items[0].dataIndex;
+              return periods[i].labelPrev + '  vs  ' + periods[i].labelRef;
+            },
+          },
+        },
+        datalabels: {
+          color: '#fff', font: { weight: 'bold', size: 11 }, textAlign: 'center',
+          display: (c) => c.dataset.data[c.dataIndex] > 0,
+          formatter: (val, c) => {
+            const ds = c.chart.data.datasets;
+            const stack = ds[c.datasetIndex].stack;
+            const total = ds.filter(d => d.stack === stack).reduce((s, d) => s + (d.data[c.dataIndex] || 0), 0);
+            const pct = total > 0 ? (val / total * 100).toFixed(1) : 0;
+            return stack === 'gPrev' ? val.toLocaleString() + '건' : val.toLocaleString() + '건\\n(' + pct + '%)';
+          },
+        },
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false } },
+        y: { stacked: true, beginAtZero: true, title: { display: true, text: '해결완료 답변 수 (건)' } },
+      },
+    },
+    plugins: [ChartDataLabels, stackTotalsPlugin],
+  });
 }
 
 // Enter 키
