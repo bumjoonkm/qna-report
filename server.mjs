@@ -274,7 +274,7 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
   });
 
   const dayMap = {};
-  await parallelMap([...allDates], async (dt) => { dayMap[dt] = await fetchDayItems(token, dt); }, 3);
+  await parallelMap([...allDates], async (dt) => { dayMap[dt] = await fetchDayItems(token, dt); }, CONCURRENCY);
 
   const isAI = (item) => AI_TA_IDS.has(item.taId);
   const sumRange = (period, predicate) => {
@@ -297,7 +297,22 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
     };
   });
 
-  return { refYear, prevYear: refYear - 1, periods };
+  const daily = [];
+  const sdRef = dtToDays(refStart), edRef = dtToDays(refEnd);
+  for (let day = sdRef; day <= edRef; day++) {
+    const dt = daysToDt(day);
+    const items = dayMap[dt] || [];
+    const total = items.length;
+    const ai = items.filter(isAI).length;
+    daily.push({
+      date: dt,
+      aiCount: ai,
+      totalCount: total,
+      ratio: total > 0 ? ai / total : null,
+    });
+  }
+
+  return { refYear, prevYear: refYear - 1, periods, daily };
 }
 
 // ── 라우팅 ──
@@ -564,7 +579,10 @@ const HTML = `<!DOCTYPE html>
       <input type="number" id="aiDays" min="1" max="365" value="7" style="width:60px"> <span>일 간격</span>
       <button class="btn" id="aiBtn" onclick="doAiStatus()">조회</button>
     </div>
-    <div class="section" style="padding:24px"><canvas id="aiChart" height="120"></canvas></div>
+    <div class="section" style="padding:24px">
+      <canvas id="aiChart" height="120"></canvas>
+      <canvas id="aiDailyRatioChart" height="80" style="margin-top:24px"></canvas>
+    </div>
   </div>
 </div>
 
@@ -874,6 +892,7 @@ function exportPerfCsv() {
 // ── AI 현황 보고 ──
 
 let aiChartInstance = null;
+let aiDailyChartInstance = null;
 
 const stackTotalsPlugin = {
   id: 'stackTotals',
@@ -931,6 +950,7 @@ async function doAiStatus() {
       alert('표시할 완전한 구간이 없습니다 (X일 간격이 총 일수보다 크거나 미래 기간)');
     } else {
       renderAiChart(data);
+      if (data.daily && data.daily.length > 0) renderAiDailyChart(data.daily);
     }
   } catch (err) { alert('오류: ' + err.message); }
   btn.disabled = false;
@@ -992,6 +1012,50 @@ function renderAiChart(data) {
       },
     },
     plugins: [ChartDataLabels, stackTotalsPlugin],
+  });
+}
+
+function renderAiDailyChart(daily) {
+  if (aiDailyChartInstance) aiDailyChartInstance.destroy();
+  const labels = daily.map(d => d.date.slice(5).replace('-', '/'));
+  const ratios = daily.map(d => d.ratio === null ? null : +(d.ratio * 100).toFixed(2));
+  const ctx = document.getElementById('aiDailyRatioChart').getContext('2d');
+  aiDailyChartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'AI TA (아이올) 해결 비율',
+        data: ratios,
+        borderColor: '#4A90E2',
+        backgroundColor: '#4A90E2',
+        tension: 0,
+        pointRadius: 3,
+        spanGaps: false,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'top' },
+        title: { display: true, text: '일자별 AI TA (아이올) 해결 비율 (%)' },
+        datalabels: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => daily[items[0].dataIndex].date,
+            label: (item) => {
+              const d = daily[item.dataIndex];
+              if (d.ratio === null) return '데이터 없음';
+              return 'AI ' + d.aiCount + '건 / 전체 ' + d.totalCount + '건 (' + (d.ratio * 100).toFixed(1) + '%)';
+            },
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { autoSkip: true, maxTicksLimit: 30 } },
+        y: { beginAtZero: true, max: 60, ticks: { stepSize: 5, callback: v => v + '%' }, title: { display: true, text: '비율 (%)' } },
+      },
+    },
   });
 }
 
