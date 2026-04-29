@@ -334,6 +334,12 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(req.method === 'HEAD' ? undefined : 'ok');
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/login') {
     const { accountId, accountPassword } = JSON.parse(await readBody(req));
     json(res, 200, await post('/v1/manager/auth', { accountId, accountPassword, certNo: null }));
