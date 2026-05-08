@@ -1,5 +1,6 @@
 import { createServer } from 'http';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import ExcelJS from 'exceljs';
 
 const API = 'https://qna-admin-api.hiconsysvc.com';
 const PORT = process.env.PORT || 3000;
@@ -315,6 +316,137 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
   return { refYear, prevYear: refYear - 1, periods, daily };
 }
 
+// ── 바우처 내역 (xlsx 다운로드) ──
+
+const VOUCHER_COLUMNS = [
+  { header: '번호', key: 'memberSerialNo', width: 8 },
+  { header: '이름', key: 'memberName', width: 12 },
+  { header: '학생연락처', key: 'studentTelephoneNumber', width: 16 },
+  { header: '관정보', key: 'erpBranchCodeName', width: 14 },
+  { header: '배부 TA meet 시간', key: 'meetIssued', width: 16 },
+  { header: '이용 TA meet 시간', key: 'meetUsed', width: 16 },
+  { header: '배부 TA meet (online) 시간', key: 'meetonIssued', width: 22 },
+  { header: '이용 TA meet (online) 시간', key: 'meetonUsed', width: 22 },
+  { header: '배부 질문하기 답변', key: 'questionIssued', width: 16 },
+  { header: '이용 질문하기 답변', key: 'questionUsed', width: 16 },
+  { header: '배부 AI 질문', key: 'aiQuestionIssued', width: 14 },
+  { header: '이용 AI 질문', key: 'aiQuestionUsed', width: 14 },
+  { header: '배부 SA 멘토링', key: 'mentoringIssued', width: 14 },
+  { header: '이용 SA 멘토링', key: 'mentoringUsed', width: 14 },
+];
+
+function pair(total, remain, unit) {
+  if (total == null) return ['-', '-'];
+  return [`${total}${unit}`, `${total - remain}${unit}`];
+}
+
+function voucherCells(v) {
+  if (!v) return {
+    meetIssued: '-', meetUsed: '-',
+    meetonIssued: '-', meetonUsed: '-',
+    questionIssued: '-', questionUsed: '-',
+    aiQuestionIssued: '-', aiQuestionUsed: '-',
+    mentoringIssued: '-', mentoringUsed: '-',
+  };
+  const [meetI, meetU] = pair(v.meetTotalVoucherHourCount, v.meetRemainVoucherHourCount, '분');
+  const [meetonI, meetonU] = pair(v.meetonTotalVoucherHourCount, v.meetonRemainVoucherHourCount, '분');
+  const [qI, qU] = pair(v.questionTotalVoucherCount, v.questionRemainVoucherCount, '회');
+  const [aiI, aiU] = pair(v.aiQuestionTotalVoucherCount, v.aiQuestionRemainVoucherCount, '회');
+  const [mI, mU] = pair(v.mentoringTotalVoucherCount, v.mentoringRemainVoucherCount, '회');
+  return {
+    meetIssued: meetI, meetUsed: meetU,
+    meetonIssued: meetonI, meetonUsed: meetonU,
+    questionIssued: qI, questionUsed: qU,
+    aiQuestionIssued: aiI, aiQuestionUsed: aiU,
+    mentoringIssued: mI, mentoringUsed: mU,
+  };
+}
+
+function extractVouchers(rawData) {
+  if (rawData == null) return [];
+  if (Array.isArray(rawData)) return rawData;
+  if (Array.isArray(rawData.memberVouchers)) return rawData.memberVouchers;
+  if (Array.isArray(rawData.vouchers)) return rawData.vouchers;
+  if (Array.isArray(rawData.contents)) return rawData.contents;
+  return [];
+}
+
+async function fetchMemberDetail(token, id) {
+  // get()이 404를 throw하므로 404는 null 반환으로 처리.
+  let info, vouchers;
+  try {
+    [info, vouchers] = await Promise.all([
+      get(`/v1/member/${id}`, token).catch(e => {
+        if (String(e.message).includes('404')) return null;
+        throw e;
+      }),
+      get(`/v1/member/${id}/vouchers`, token).catch(e => {
+        if (String(e.message).includes('404')) return null;
+        throw e;
+      }),
+    ]);
+  } catch (e) {
+    throw e;
+  }
+  if (!info) return null;
+  const m = info.data ?? info;
+  const vs = extractVouchers(vouchers?.data ?? vouchers ?? null);
+  return {
+    id, memberSerialNo: id,
+    memberName: m?.memberName ?? '',
+    studentTelephoneNumber: m?.studentTelephoneNumber ?? '',
+    erpBranchCodeName: m?.erpBranchCodeName ?? '',
+    vouchers: vs,
+  };
+}
+
+function monthsInRange(monthStart, monthEnd) {
+  const [ys, ms] = monthStart.split('-').map(Number);
+  const [ye, me] = monthEnd.split('-').map(Number);
+  const out = [];
+  for (let y = ys; y <= ye; y++) {
+    const mFrom = y === ys ? ms : 1;
+    const mTo = y === ye ? me : 12;
+    for (let mo = mFrom; mo <= mTo; mo++) {
+      out.push(`${y}-${String(mo).padStart(2, '0')}`);
+    }
+  }
+  return out;
+}
+
+async function exportVouchers(token, monthStart, monthEnd, idStart, idEnd) {
+  const ids = [];
+  for (let id = idStart; id <= idEnd; id++) ids.push(id);
+
+  const results = await parallelMap(ids, (id) => fetchMemberDetail(token, id), CONCURRENCY);
+  const members = results.filter(m => m).sort((a, b) => a.id - b.id);
+
+  const months = monthsInRange(monthStart, monthEnd);
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'qna-report';
+  wb.created = new Date();
+
+  for (const ym of months) {
+    const sheet = wb.addWorksheet(`${parseInt(ym.slice(5), 10)}월`);
+    sheet.columns = VOUCHER_COLUMNS;
+    sheet.getRow(1).font = { bold: true };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEEEEEE' } };
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+    for (const m of members) {
+      const v = m.vouchers.find(v => v.startDt && v.startDt.slice(0, 7) === ym);
+      sheet.addRow({
+        memberSerialNo: m.memberSerialNo,
+        memberName: m.memberName,
+        studentTelephoneNumber: m.studentTelephoneNumber,
+        erpBranchCodeName: m.erpBranchCodeName,
+        ...voucherCells(v),
+      });
+    }
+  }
+
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
 // ── 라우팅 ──
 
 function readBody(req) {
@@ -402,6 +534,34 @@ const server = createServer(async (req, res) => {
     if (!token || !startMonth || !endMonth || !days || days < 1) { json(res, 400, { error: 'token, start, end, days 필요' }); return; }
     try { json(res, 200, await cached(`aistatus:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
     catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/voucher-export') {
+    const token = url.searchParams.get('token');
+    const monthStart = url.searchParams.get('monthStart');
+    const monthEnd = url.searchParams.get('monthEnd');
+    const idStart = parseInt(url.searchParams.get('idStart'));
+    const idEnd = parseInt(url.searchParams.get('idEnd'));
+    if (!token || !monthStart || !monthEnd || !Number.isFinite(idStart) || !Number.isFinite(idEnd) || idStart > idEnd) {
+      json(res, 400, { error: 'token, monthStart, monthEnd, idStart, idEnd 필수 (idStart <= idEnd)' });
+      return;
+    }
+    try {
+      const buf = await cached(
+        `voucher:${monthStart}:${monthEnd}:${idStart}:${idEnd}`,
+        () => exportVouchers(token, monthStart, monthEnd, idStart, idEnd),
+      );
+      const filename = `voucher-${monthStart}_${monthEnd}.xlsx`;
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': buf.length,
+      });
+      res.end(buf);
+    } catch (e) {
+      json(res, 500, { error: e.message });
+    }
     return;
   }
 
@@ -539,6 +699,7 @@ const HTML = `<!DOCTYPE html>
     <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄표</div>
     <div class="tab" onclick="switchTab('perf')">TA 성과</div>
     <div class="tab" onclick="switchTab('ai')">AI 현황 보고</div>
+    <div class="tab" onclick="switchTab('voucher')">바우처 내역 확인</div>
   </div>
 
   <!-- 답변불가 리포트 -->
@@ -589,6 +750,20 @@ const HTML = `<!DOCTYPE html>
       <canvas id="aiChart" height="120"></canvas>
       <canvas id="aiDailyRatioChart" height="80" style="margin-top:24px"></canvas>
     </div>
+  </div>
+
+  <!-- 바우처 내역 확인 -->
+  <div class="page" id="page-voucher">
+    <div class="ctrl">
+      <select id="vMonthStart"></select><span>월부터</span>
+      <select id="vMonthEnd"></select><span>월까지</span>
+      <span style="margin-left:12px">학생번호</span>
+      <input type="number" id="vIdStart" value="6500" style="width:90px">
+      <span>~</span>
+      <input type="number" id="vIdEnd" value="11364" style="width:90px">
+      <button class="btn" id="vBtn" onclick="doVoucherDownload()">엑셀 다운로드</button>
+    </div>
+    <div id="voucherStatus"></div>
   </div>
 </div>
 
@@ -652,6 +827,7 @@ function initApp() {
   schMonth = now.getMonth() + 1;
   updateMonthLabel();
   initAiSelects();
+  initVoucherSelects();
 }
 
 // ── 탭 ──
@@ -893,6 +1069,65 @@ function exportPerfCsv() {
   const rows = [['#', 'TA ID', 'TA 이름', '답변 건수', '평균 소요시간 (분)', '평균 별점']];
   d.taList.forEach((ta, i) => rows.push([i + 1, ta.taId, ta.name, ta.count, ta.avgMin, ta.avgStar]));
   downloadCsv('TA성과_' + d.period.start + '_' + d.period.end + '.csv', rows);
+}
+
+// ── 바우처 내역 ──
+
+function initVoucherSelects() {
+  const now = new Date();
+  const months = [];
+  // 2026년 1월부터 현재 월까지
+  for (let m = 1; m <= now.getMonth() + 1; m++) {
+    months.push(now.getFullYear() + '-' + String(m).padStart(2, '0'));
+  }
+  ['vMonthStart', 'vMonthEnd'].forEach(id => {
+    const sel = document.getElementById(id);
+    sel.innerHTML = '';
+    months.forEach(m => sel.add(new Option(m, m)));
+  });
+  document.getElementById('vMonthStart').value = months[0];
+  document.getElementById('vMonthEnd').value = months[months.length - 1];
+}
+
+async function doVoucherDownload() {
+  const ms = document.getElementById('vMonthStart').value;
+  const me = document.getElementById('vMonthEnd').value;
+  const is = document.getElementById('vIdStart').value;
+  const ie = document.getElementById('vIdEnd').value;
+  if (!TOKEN || !ms || !me || !is || !ie) return;
+  if (parseInt(is) > parseInt(ie)) {
+    document.getElementById('voucherStatus').innerHTML =
+      '<div style="color:#e53e3e;padding:20px">시작 번호가 종료 번호보다 큽니다</div>';
+    return;
+  }
+  const btn = document.getElementById('vBtn');
+  btn.disabled = true; btn.textContent = '다운로드 중...';
+  const t0 = Date.now();
+  document.getElementById('voucherStatus').innerHTML =
+    '<div class="loading">크롤링 + 엑셀 생성 중. 학생 수에 따라 1-3분 소요됩니다... (' +
+    (parseInt(ie) - parseInt(is) + 1) + '명, 같은 입력 재요청 시 캐시 즉시 응답)</div>';
+  try {
+    const url = '/api/voucher-export?token=' + encodeURIComponent(TOKEN) +
+      '&monthStart=' + ms + '&monthEnd=' + me + '&idStart=' + is + '&idEnd=' + ie;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+      throw new Error(err.error || ('HTTP ' + res.status));
+    }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '바우처_' + ms + '_' + me + '_' + is + '-' + ie + '.xlsx';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    const sec = ((Date.now() - t0) / 1000).toFixed(1);
+    document.getElementById('voucherStatus').innerHTML =
+      '<div style="color:#047857;padding:20px">✓ 다운로드 완료 (' + sec + '초, ' + (blob.size / 1024).toFixed(0) + ' KB)</div>';
+  } catch (err) {
+    document.getElementById('voucherStatus').innerHTML =
+      '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = '엑셀 다운로드';
 }
 
 // ── AI 현황 보고 ──

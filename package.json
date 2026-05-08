@@ -2,5 +2,8 @@
   "name": "qna-report",
   "type": "module",
   "scripts": { "start": "node server.mjs" },
-  "engines": { "node": ">=18" }
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
 }
