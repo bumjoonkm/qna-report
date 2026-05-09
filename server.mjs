@@ -320,24 +320,25 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
 
 const VOUCHER_COLUMNS = [
   { header: '번호', key: 'memberSerialNo', width: 8 },
+  { header: '아이디', key: 'erpMemberId', width: 12 },
   { header: '이름', key: 'memberName', width: 12 },
   { header: '학생연락처', key: 'studentTelephoneNumber', width: 16 },
   { header: '관정보', key: 'erpBranchCodeName', width: 14 },
-  { header: '배부 TA meet 시간', key: 'meetIssued', width: 16 },
-  { header: '이용 TA meet 시간', key: 'meetUsed', width: 16 },
-  { header: '배부 TA meet (online) 시간', key: 'meetonIssued', width: 22 },
-  { header: '이용 TA meet (online) 시간', key: 'meetonUsed', width: 22 },
-  { header: '배부 질문하기 답변', key: 'questionIssued', width: 16 },
-  { header: '이용 질문하기 답변', key: 'questionUsed', width: 16 },
-  { header: '배부 AI 질문', key: 'aiQuestionIssued', width: 14 },
-  { header: '이용 AI 질문', key: 'aiQuestionUsed', width: 14 },
-  { header: '배부 SA 멘토링', key: 'mentoringIssued', width: 14 },
-  { header: '이용 SA 멘토링', key: 'mentoringUsed', width: 14 },
+  { header: '배부 TA meet 시간(분)', key: 'meetIssued', width: 18 },
+  { header: '이용 TA meet 시간(분)', key: 'meetUsed', width: 18 },
+  { header: '배부 TA meet (online) 시간(분)', key: 'meetonIssued', width: 24 },
+  { header: '이용 TA meet (online) 시간(분)', key: 'meetonUsed', width: 24 },
+  { header: '배부 질문하기 답변(회)', key: 'questionIssued', width: 18 },
+  { header: '이용 질문하기 답변(회)', key: 'questionUsed', width: 18 },
+  { header: '배부 AI 질문(회)', key: 'aiQuestionIssued', width: 16 },
+  { header: '이용 AI 질문(회)', key: 'aiQuestionUsed', width: 16 },
+  { header: '배부 SA 멘토링(회)', key: 'mentoringIssued', width: 16 },
+  { header: '이용 SA 멘토링(회)', key: 'mentoringUsed', width: 16 },
 ];
 
-function pair(total, remain, unit) {
+function pair(total, remain) {
   if (total == null) return ['-', '-'];
-  return [`${total}${unit}`, `${total - remain}${unit}`];
+  return [total, total - remain];
 }
 
 function voucherCells(v) {
@@ -348,11 +349,11 @@ function voucherCells(v) {
     aiQuestionIssued: '-', aiQuestionUsed: '-',
     mentoringIssued: '-', mentoringUsed: '-',
   };
-  const [meetI, meetU] = pair(v.meetTotalVoucherHourCount, v.meetRemainVoucherHourCount, '분');
-  const [meetonI, meetonU] = pair(v.meetonTotalVoucherHourCount, v.meetonRemainVoucherHourCount, '분');
-  const [qI, qU] = pair(v.questionTotalVoucherCount, v.questionRemainVoucherCount, '회');
-  const [aiI, aiU] = pair(v.aiQuestionTotalVoucherCount, v.aiQuestionRemainVoucherCount, '회');
-  const [mI, mU] = pair(v.mentoringTotalVoucherCount, v.mentoringRemainVoucherCount, '회');
+  const [meetI, meetU] = pair(v.meetTotalVoucherHourCount, v.meetRemainVoucherHourCount);
+  const [meetonI, meetonU] = pair(v.meetonTotalVoucherHourCount, v.meetonRemainVoucherHourCount);
+  const [qI, qU] = pair(v.questionTotalVoucherCount, v.questionRemainVoucherCount);
+  const [aiI, aiU] = pair(v.aiQuestionTotalVoucherCount, v.aiQuestionRemainVoucherCount);
+  const [mI, mU] = pair(v.mentoringTotalVoucherCount, v.mentoringRemainVoucherCount);
   return {
     meetIssued: meetI, meetUsed: meetU,
     meetonIssued: meetonI, meetonUsed: meetonU,
@@ -393,6 +394,7 @@ async function fetchMemberDetail(token, id) {
   const vs = extractVouchers(vouchers?.data ?? vouchers ?? null);
   return {
     id, memberSerialNo: id,
+    erpMemberId: m?.erpMemberId ?? '',
     memberName: m?.memberName ?? '',
     studentTelephoneNumber: m?.studentTelephoneNumber ?? '',
     erpBranchCodeName: m?.erpBranchCodeName ?? '',
@@ -436,6 +438,7 @@ async function exportVouchers(token, monthStart, monthEnd, idStart, idEnd) {
       const v = m.vouchers.find(v => v.startDt && v.startDt.slice(0, 7) === ym);
       sheet.addRow({
         memberSerialNo: m.memberSerialNo,
+        erpMemberId: m.erpMemberId,
         memberName: m.memberName,
         studentTelephoneNumber: m.studentTelephoneNumber,
         erpBranchCodeName: m.erpBranchCodeName,
@@ -549,7 +552,7 @@ const server = createServer(async (req, res) => {
     }
     try {
       const buf = await cached(
-        `voucher:${monthStart}:${monthEnd}:${idStart}:${idEnd}`,
+        `voucher:v2:${monthStart}:${monthEnd}:${idStart}:${idEnd}`,
         () => exportVouchers(token, monthStart, monthEnd, idStart, idEnd),
       );
       const filename = `voucher-${monthStart}_${monthEnd}.xlsx`;
