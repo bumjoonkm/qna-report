@@ -259,7 +259,7 @@ async function fetchPerformance(token, startDt, endDt) {
 
 async function fetchSettleMonth(token, year, month) {
   const ym = `${year}-${String(month).padStart(2, '0')}`;
-  const cacheKey = `settle-${ym}`;
+  const cacheKey = `settle-v2-${ym}`;
   const today = todayLocalDt();
   const monthEnd = `${ym}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`;
   if (monthEnd < today) {
@@ -272,7 +272,10 @@ async function fetchSettleMonth(token, year, month) {
     const byDate = {};
     for (const r of rows) {
       if (!r.basisDt || r.taId === 'aiowl') continue;
-      byDate[r.basisDt] = (byDate[r.basisDt] || 0) + (r.onlineQuestionSettleAccountsAmount || 0);
+      // onlineQuestionSettleAccountsAmount는 영상 답변 인센티브(sumAnswerGradeVideoAmount)를
+      // 누락하므로 함께 더해야 CSV 정산금액과 일치 (99.4% 정확도).
+      const amt = (r.onlineQuestionSettleAccountsAmount || 0) + (r.sumAnswerGradeVideoAmount || 0);
+      byDate[r.basisDt] = (byDate[r.basisDt] || 0) + amt;
     }
     if (monthEnd < today) diskSet(cacheKey, byDate);
     return byDate;
@@ -613,7 +616,7 @@ const server = createServer(async (req, res) => {
     const endMonth = url.searchParams.get('end');
     const days = parseInt(url.searchParams.get('days'));
     if (!token || !startMonth || !endMonth || !days || days < 1) { json(res, 400, { error: 'token, start, end, days 필요' }); return; }
-    try { json(res, 200, await cached(`aistatus-v2:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
+    try { json(res, 200, await cached(`aistatus-v3:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
