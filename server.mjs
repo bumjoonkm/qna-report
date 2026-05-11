@@ -38,6 +38,7 @@ const BRANCHES = [
 ];
 
 const AI_TA_IDS = new Set(['aiowl']);
+const USD_TO_KRW = 1450;
 
 function lastDayOfMonth(year, month) {
   return new Date(year, month, 0).getDate();
@@ -194,7 +195,7 @@ async function fetchSalaryAll(token, year, month) {
 // 하루치 데이터 가져오기 (디스크 캐시 활용)
 async function fetchDayItems(token, dt) {
   const today = new Date().toISOString().slice(0, 10);
-  const cacheKey = `perf-${dt}`;
+  const cacheKey = `perf2-${dt}`;
   if (dt < today) {
     const cached = diskGet(cacheKey);
     if (cached) return cached;
@@ -209,6 +210,7 @@ async function fetchDayItems(token, dt) {
   }
   const simplified = items.filter(i => i.taId || i.taName).map(i => ({
     taId: i.taId, taName: i.taName, admitAt: i.consultationAdmissionAt, answerEndAt: i.answerEndAt, starScore: i.starScore,
+    aiCostTotal: i.aiCostTotal ?? 0,
   }));
   if (dt < today) diskSet(cacheKey, simplified);
   return simplified;
@@ -253,6 +255,47 @@ async function fetchPerformance(token, startDt, endDt) {
   };
 }
 
+// ── 정산 데이터 (온라인 질문 TA 급여) ──
+
+async function fetchSettleMonth(token, year, month) {
+  const ym = `${year}-${String(month).padStart(2, '0')}`;
+  const cacheKey = `settle-${ym}`;
+  const today = todayLocalDt();
+  const monthEnd = `${ym}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`;
+  if (monthEnd < today) {
+    const c = diskGet(cacheKey);
+    if (c) return c;
+  }
+  try {
+    const res = await get(`/v1/qna/settle/online/detail?year=${year}&month=${month}&workDivisionCommonCode=QA510001`, token);
+    const rows = Array.isArray(res?.data) ? res.data : (res?.data?.contents ?? []);
+    const byDate = {};
+    for (const r of rows) {
+      if (!r.basisDt || r.taId === 'aiowl') continue;
+      byDate[r.basisDt] = (byDate[r.basisDt] || 0) + (r.onlineQuestionSettleAccountsAmount || 0);
+    }
+    if (monthEnd < today) diskSet(cacheKey, byDate);
+    return byDate;
+  } catch (e) {
+    return {};
+  }
+}
+
+async function fetchSettleForRange(token, startDt, endDt) {
+  const [ys, ms] = startDt.split('-').map(Number);
+  const [ye, me] = endDt.split('-').map(Number);
+  const months = [];
+  for (let y = ys; y <= ye; y++) {
+    const mFrom = y === ys ? ms : 1;
+    const mTo = y === ye ? me : 12;
+    for (let mo = mFrom; mo <= mTo; mo++) months.push({ y, m: mo });
+  }
+  const maps = await parallelMap(months, ({ y, m }) => fetchSettleMonth(token, y, m), 6);
+  const merged = {};
+  for (const m of maps) Object.assign(merged, m);
+  return merged;
+}
+
 // ── AI 현황 보고 ──
 
 async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
@@ -277,6 +320,15 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
   const dayMap = {};
   await parallelMap([...allDates], async (dt) => { dayMap[dt] = await fetchDayItems(token, dt); }, CONCURRENCY);
 
+  const refRangeStart = periodsRef[0]?.start;
+  const refRangeEnd = periodsRef[periodsRef.length - 1]?.end;
+  const prevRangeStart = periodsPrev[0]?.start;
+  const prevRangeEnd = periodsPrev[periodsPrev.length - 1]?.end;
+  const [settleRef, settlePrev] = await Promise.all([
+    refRangeStart ? fetchSettleForRange(token, refRangeStart, refRangeEnd) : Promise.resolve({}),
+    prevRangeStart ? fetchSettleForRange(token, prevRangeStart, prevRangeEnd) : Promise.resolve({}),
+  ]);
+
   const isAI = (item) => AI_TA_IDS.has(item.taId);
   const sumRange = (period, predicate) => {
     let total = 0;
@@ -286,15 +338,41 @@ async function fetchAiStatus(token, monthA, monthB, daysPerBucket) {
     }
     return total;
   };
+  const sumSettleRange = (period, byDate) => {
+    let total = 0;
+    const sd = dtToDays(period.start), ed = dtToDays(period.end);
+    for (let day = sd; day <= ed; day++) total += byDate[daysToDt(day)] || 0;
+    return total;
+  };
+  const sumAiCostRange = (period) => {
+    let usd = 0;
+    const sd = dtToDays(period.start), ed = dtToDays(period.end);
+    for (let day = sd; day <= ed; day++) {
+      for (const item of (dayMap[daysToDt(day)] || [])) {
+        if (AI_TA_IDS.has(item.taId)) usd += item.aiCostTotal || 0;
+      }
+    }
+    return Math.round(usd * USD_TO_KRW);
+  };
 
   const periods = periodsRef.map((pRef, i) => {
     const pPrev = periodsPrev[i];
+    const costPrev = sumSettleRange(pPrev, settlePrev);
+    const costRefHuman = sumSettleRange(pRef, settleRef);
+    const costRefAi = sumAiCostRange(pRef);
+    const costRef = costRefHuman + costRefAi;
+    const savingsPct = costPrev > 0 ? ((costPrev - costRef) / costPrev) * 100 : null;
     return {
       labelRef: `${pRef.start} ~ ${pRef.end}`,
       labelPrev: `${pPrev.start} ~ ${pPrev.end}`,
       yPrev_human: sumRange(pPrev, x => !isAI(x)),
       yRef_human: sumRange(pRef, x => !isAI(x)),
       yRef_ai: sumRange(pRef, x => isAI(x)),
+      costPrev,
+      costRefHuman,
+      costRefAi,
+      costRef,
+      savingsPct,
     };
   });
 
@@ -535,7 +613,7 @@ const server = createServer(async (req, res) => {
     const endMonth = url.searchParams.get('end');
     const days = parseInt(url.searchParams.get('days'));
     if (!token || !startMonth || !endMonth || !days || days < 1) { json(res, 400, { error: 'token, start, end, days 필요' }); return; }
-    try { json(res, 200, await cached(`aistatus:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
+    try { json(res, 200, await cached(`aistatus-v2:${startMonth}:${endMonth}:${days}`, () => fetchAiStatus(token, startMonth, endMonth, days))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -750,8 +828,10 @@ const HTML = `<!DOCTYPE html>
       <button class="btn" id="aiBtn" onclick="doAiStatus()">조회</button>
     </div>
     <div class="section" style="padding:24px">
+      <h2 id="aiChartTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:8px"></h2>
       <canvas id="aiChart" height="120"></canvas>
-      <canvas id="aiDailyRatioChart" height="80" style="margin-top:24px"></canvas>
+      <h2 id="aiDailyChartTitle" style="font-size:16px;font-weight:600;color:#333;text-align:center;margin-top:24px;margin-bottom:12px"></h2>
+      <canvas id="aiDailyRatioChart" height="80"></canvas>
     </div>
   </div>
 
@@ -1142,21 +1222,44 @@ const stackTotalsPlugin = {
   id: 'stackTotals',
   afterDatasetsDraw(chart) {
     const { ctx, data } = chart;
+    const periods = chart.config._aiPeriods || [];
     ctx.save();
-    ctx.fillStyle = '#D9534F';
-    ctx.font = 'bold 12px sans-serif';
     ctx.textAlign = 'center';
     data.labels.forEach((_, i) => {
+      const stacks = {};
       ['gPrev', 'gRef'].forEach(stack => {
         const datasets = data.datasets.filter(d => d.stack === stack);
         const total = datasets.reduce((s, d) => s + (d.data[i] || 0), 0);
-        if (total === 0) return;
+        if (total === 0) { stacks[stack] = null; return; }
         const lastDs = datasets[datasets.length - 1];
         const dsIdx = data.datasets.indexOf(lastDs);
         const meta = chart.getDatasetMeta(dsIdx);
         const bar = meta.data[i];
-        ctx.fillText('총 ' + total.toLocaleString() + '건', bar.x, bar.y - 6);
+        stacks[stack] = { x: bar.x, y: bar.y, total };
       });
+      ctx.fillStyle = '#D9534F';
+      ctx.font = 'bold 11px sans-serif';
+      if (stacks.gPrev) ctx.fillText('총 ' + stacks.gPrev.total.toLocaleString() + '건', stacks.gPrev.x, stacks.gPrev.y - 8);
+      if (stacks.gRef)  ctx.fillText('총 ' + stacks.gRef.total.toLocaleString()  + '건', stacks.gRef.x,  stacks.gRef.y  - 8);
+      const period = periods[i];
+      if (!period) return;
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#333';
+      if (stacks.gPrev && period.costPrev > 0) {
+        ctx.fillText('₩' + period.costPrev.toLocaleString(), stacks.gPrev.x, stacks.gPrev.y - 26);
+      }
+      if (stacks.gRef && period.costRef > 0) {
+        ctx.fillText('₩' + period.costRef.toLocaleString(), stacks.gRef.x, stacks.gRef.y - 26);
+      }
+      if (period.savingsPct !== null && stacks.gPrev && stacks.gRef) {
+        const cx = (stacks.gPrev.x + stacks.gRef.x) / 2;
+        const cy = Math.min(stacks.gPrev.y, stacks.gRef.y) - 54;
+        const pct = period.savingsPct;
+        const label = pct >= 0 ? pct.toFixed(1) + '% 감축' : Math.abs(pct).toFixed(1) + '% 증가';
+        ctx.fillStyle = pct >= 0 ? '#D9534F' : '#888';
+        ctx.font = 'bold 15px sans-serif';
+        ctx.fillText(label, cx, cy);
+      }
     });
     ctx.restore();
   }
@@ -1211,6 +1314,12 @@ function renderAiChart(data) {
   });
   const refSuffix = String(refYear).slice(2);
   const prevSuffix = String(prevYear).slice(2);
+  const titleEl = document.getElementById('aiChartTitle');
+  if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 해결완료 답변 수 + 온라인 TA 급여 비교';
+  const maxStack = Math.max(0, ...periods.map(p => Math.max(p.yPrev_human, p.yRef_human + p.yRef_ai)));
+  const yMaxRaw = maxStack * 1.3;
+  const step = maxStack > 5000 ? 1000 : (maxStack > 500 ? 500 : 100);
+  const yMax = Math.ceil(yMaxRaw / step) * step;
   const datasets = [
     { label: prevSuffix + '년 인간 TA', backgroundColor: '#F1BF42', stack: 'gPrev',
       data: periods.map(p => p.yPrev_human) },
@@ -1226,10 +1335,10 @@ function renderAiChart(data) {
     data: { labels: labels, datasets: datasets },
     options: {
       responsive: true,
-      layout: { padding: { top: 28 } },
+      layout: { padding: { top: 8, bottom: 8 } },
       plugins: {
-        legend: { position: 'top' },
-        title: { display: true, text: prevSuffix + '년 vs ' + refSuffix + '년 해결완료 답변 수 비교 (질문 상태=문제해결)' },
+        legend: { position: 'bottom', labels: { padding: 16 } },
+        title: { display: false },
         tooltip: {
           callbacks: {
             title: (items) => {
@@ -1251,18 +1360,22 @@ function renderAiChart(data) {
         },
       },
       scales: {
-        x: { stacked: true, grid: { display: false } },
-        y: { stacked: true, beginAtZero: true, title: { display: true, text: '해결완료 답변 수 (건)' } },
+        x: { stacked: true, grid: { display: false }, categoryPercentage: 0.7, barPercentage: 0.8 },
+        y: { stacked: true, beginAtZero: true, max: yMax, title: { display: true, text: '해결완료 답변 수 (건)' } },
       },
     },
     plugins: [ChartDataLabels, stackTotalsPlugin],
   });
+  aiChartInstance.config._aiPeriods = periods;
+  aiChartInstance.update();
 }
 
 function renderAiDailyChart(daily) {
   if (aiDailyChartInstance) aiDailyChartInstance.destroy();
   const labels = daily.map(d => d.date.slice(5).replace('-', '/'));
   const ratios = daily.map(d => d.ratio === null ? null : +(d.ratio * 100).toFixed(2));
+  const dailyTitleEl = document.getElementById('aiDailyChartTitle');
+  if (dailyTitleEl) dailyTitleEl.textContent = '일자별 AI TA (아이올) 해결 비율 (%)';
   const ctx = document.getElementById('aiDailyRatioChart').getContext('2d');
   aiDailyChartInstance = new Chart(ctx, {
     type: 'line',
@@ -1282,7 +1395,7 @@ function renderAiDailyChart(daily) {
       responsive: true,
       plugins: {
         legend: { position: 'top' },
-        title: { display: true, text: '일자별 AI TA (아이올) 해결 비율 (%)' },
+        title: { display: false },
         datalabels: { display: false },
         tooltip: {
           callbacks: {
