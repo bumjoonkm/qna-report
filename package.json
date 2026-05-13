@@ -1,7 +1,11 @@
 {
   "name": "qna-report",
   "type": "module",
-  "scripts": { "start": "node server.mjs" },
+  "scripts": {
+    "start": "node server.mjs",
+    "verify": "i=0; until curl -fs --max-time 10 https://qna-report.onrender.com/healthz > /dev/null; do i=$((i+1)); test $i -ge 30 && echo 'verify FAILED: not 200 after 5min' && exit 1; printf '.'; sleep 10; done; echo ' OK'",
+    "deploy": "git push && npm run verify"
+  },
   "engines": { "node": ">=18" },
   "dependencies": {
     "exceljs": "^4.4.0"
