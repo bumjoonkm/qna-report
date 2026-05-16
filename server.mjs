@@ -17,15 +17,55 @@ function cached(key, fn) {
   return fn().then(data => { cache.set(key, { data, ts: Date.now() }); return data; });
 }
 
-// ── 디스크 캐시 (영구, 과거 데이터용) ──
+// ── 디스크 캐시 (로컬 /tmp) + Upstash Redis (영구) ──
+//   로컬: dyno 라이프타임 내 빠른 읽기.
+//   Upstash: dyno 재시작·재배포 후에도 유지. env 미설정 시 fallback (로컬만).
 if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
-function diskGet(key) {
+const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const UPSTASH_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
+if (UPSTASH_ENABLED) console.log('[cache] Upstash 영속 캐시 활성화');
+else console.log('[cache] Upstash env 없음 — 로컬 /tmp 캐시만 사용');
+
+async function upstashGet(key) {
+  if (!UPSTASH_ENABLED) return null;
+  try {
+    const res = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (body == null || body.result == null) return null;
+    return JSON.parse(body.result);
+  } catch { return null; }
+}
+function upstashSet(key, data) {
+  if (!UPSTASH_ENABLED) return;
+  // fire-and-forget — 응답 지연 방지
+  fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'text/plain' },
+    body: JSON.stringify(data),
+  }).catch(() => {});
+}
+
+async function diskGet(key) {
+  // 1) 로컬 hit
   const p = `${CACHE_DIR}/${key}.json`;
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
+  if (existsSync(p)) {
+    try { return JSON.parse(readFileSync(p, 'utf8')); } catch {}
+  }
+  // 2) Upstash hit → 로컬에도 백필
+  const remote = await upstashGet(key);
+  if (remote != null) {
+    try { writeFileSync(p, JSON.stringify(remote)); } catch {}
+    return remote;
+  }
+  return null;
 }
 function diskSet(key, data) {
   try { writeFileSync(`${CACHE_DIR}/${key}.json`, JSON.stringify(data)); } catch {}
+  upstashSet(key, data);
 }
 
 const BRANCHES = [
@@ -219,7 +259,7 @@ async function fetchDayItems(token, dt) {
   const today = new Date().toISOString().slice(0, 10);
   const cacheKey = `perf2-${dt}`;
   if (dt < today) {
-    const cached = diskGet(cacheKey);
+    const cached = await diskGet(cacheKey);
     if (cached) return cached;
   }
   const items = [];
@@ -284,7 +324,7 @@ async function fetchDayVideoFiles(token, dt) {
   const today = todayLocalDt();
   const cacheKey = `vidreuse-day-${dt}`;
   if (dt < today) {
-    const c = diskGet(cacheKey);
+    const c = await diskGet(cacheKey);
     if (c) return c;
   }
   // 1) 일별 온라인+문제해결 list 페이지네이션
@@ -467,7 +507,7 @@ async function fetchSettleMonth(token, year, month) {
   const today = todayLocalDt();
   const monthEnd = `${ym}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`;
   if (monthEnd < today) {
-    const c = diskGet(cacheKey);
+    const c = await diskGet(cacheKey);
     if (c) return c;
   }
   try {
