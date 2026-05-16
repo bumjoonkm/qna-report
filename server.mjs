@@ -1771,9 +1771,9 @@ function exportVideoReuseCsv() {
   });
   const csv = rows.map(r => r.map(c => {
     const s = c == null ? '' : String(c);
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  }).join(',')).join('\n');
-  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+    return /[",\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\\n');
+  const blob = new Blob(['\\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = '동영상재활용_' + d.period.start + '_' + d.period.end + '.csv';
