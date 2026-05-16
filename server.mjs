@@ -320,9 +320,11 @@ async function fetchPerformance(token, startDt, endDt) {
 // ── 동영상 재활용 ──
 
 // 하루치: 온라인 + 문제해결 질문의 비디오 첨부만 추출. 과거일은 디스크 캐시.
+// 캐시 entry에 HEAD 결과(etag/contentLength)까지 박아둬서 재검색 시 HEAD 재호출 안 함.
+// 파일 URL은 immutable이라 한 번 채우면 변하지 않음. (v2: HEAD 포함)
 async function fetchDayVideoFiles(token, dt) {
   const today = todayLocalDt();
-  const cacheKey = `vidreuse-day-${dt}`;
+  const cacheKey = `vidreuse-day-v2-${dt}`;
   if (dt < today) {
     const c = await diskGet(cacheKey);
     if (c) return c;
@@ -359,11 +361,21 @@ async function fetchDayVideoFiles(token, dt) {
           filePathways: f.filePathways,
           fileName: f.fileName,
           qnaFileSerialNo: f.qnaFileSerialNo,
+          url: buildAttachmentUrl(f.filePathways, f.fileName),
         })),
       };
     } catch { return null; }
   }, CONCURRENCY);
   const result = enriched.filter(x => x !== null);
+  // 3) HEAD로 etag/contentLength 채우기 → 캐시 entry에 영속화 (CDN 파일 URL immutable)
+  const flatFiles = [];
+  for (const q of result) for (const f of q.videoFiles) flatFiles.push(f);
+  await parallelMap(flatFiles, async (f) => {
+    const h = await fetchHead(f.url);
+    f.etag = h.etag || null;
+    f.contentLength = h.contentLength || 0;
+    if (h.error) f.headError = h.error;
+  }, CONCURRENCY);
   if (dt < today) diskSet(cacheKey, result);
   return result;
 }
@@ -382,16 +394,19 @@ async function fetchVideoReuse(token, startDt, endDt) {
   const dayItems = dayResults.flat();
 
   // 첨부 평면화 + (masterSerialNo, qnaFileSerialNo) dedup (페이지네이션 보호)
+  // etag/contentLength는 fetchDayVideoFiles에서 이미 채워져 있음 (캐시 hit 시 HEAD 0회)
   const seen = new Set();
-  const attachments = [];
+  const heads = [];
   for (const q of dayItems) {
     for (const f of q.videoFiles) {
       const k = `${q.masterSerialNo}|${f.qnaFileSerialNo}`;
       if (seen.has(k)) continue;
       seen.add(k);
-      attachments.push({
-        url: buildAttachmentUrl(f.filePathways, f.fileName),
+      heads.push({
+        url: f.url || buildAttachmentUrl(f.filePathways, f.fileName),
         fileName: f.fileName,
+        etag: f.etag || null,
+        contentLength: f.contentLength || 0,
         masterSerialNo: q.masterSerialNo,
         taId: q.taId,
         taName: q.taName,
@@ -404,12 +419,6 @@ async function fetchVideoReuse(token, startDt, endDt) {
       });
     }
   }
-
-  // HEAD로 ETag (병렬 20)
-  const heads = await parallelMap(attachments, async (a) => {
-    const h = await fetchHead(a.url);
-    return { ...a, etag: h.etag || null, contentLength: h.contentLength || 0, headError: h.error || null };
-  }, CONCURRENCY);
 
   // ETag 그룹핑
   const byEtag = new Map();
@@ -870,8 +879,18 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/video-reuse') {
     const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
     if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
-    try { json(res, 200, await cached(`vidreuse:${start}:${end}`, () => fetchVideoReuse(token, start, end))); }
-    catch (e) { json(res, 500, { error: e.message }); }
+    try {
+      const today = todayLocalDt();
+      const resultKey = `vidreuse-result-${start}-${end}`;
+      // 과거 완료 기간이면 Upstash 결과 캐시 우선 (dyno 재시작 후에도 유지)
+      if (end < today) {
+        const hit = await diskGet(resultKey);
+        if (hit) { json(res, 200, hit); return; }
+      }
+      const data = await cached(`vidreuse:${start}:${end}`, () => fetchVideoReuse(token, start, end));
+      if (end < today) diskSet(resultKey, data);
+      json(res, 200, data);
+    } catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
 
