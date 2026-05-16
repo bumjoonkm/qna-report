@@ -118,6 +118,28 @@ async function parallelMap(arr, fn, concurrency) {
   return results;
 }
 
+// ── 동영상 재활용 헬퍼 ──
+
+const VIDEO_EXTS = new Set(['mp4', 'mov']);
+function isVideoFile(name) {
+  if (!name) return false;
+  const e = name.split('.').pop().toLowerCase();
+  return VIDEO_EXTS.has(e);
+}
+function buildAttachmentUrl(filePathways, fileName) {
+  return `https://qna-image.hiconsysvc.com/${filePathways}/${fileName}`;
+}
+async function fetchHead(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD' });
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    return {
+      etag: (res.headers.get('etag') || '').replace(/"/g, ''),
+      contentLength: parseInt(res.headers.get('content-length') || '0', 10),
+    };
+  } catch (e) { return { error: e.message }; }
+}
+
 // ── 답변불가 리포트 ──
 
 async function fetchReport(token, startDt, endDt) {
@@ -252,6 +274,188 @@ async function fetchPerformance(token, startDt, endDt) {
     avgMin: totalCount > 0 ? Math.round(totalMin / totalCount) : 0,
     avgStar: starItems > 0 ? (totalStar / starItems).toFixed(1) : '-',
     taList,
+  };
+}
+
+// ── 동영상 재활용 ──
+
+// 하루치: 온라인 + 문제해결 질문의 비디오 첨부만 추출. 과거일은 디스크 캐시.
+async function fetchDayVideoFiles(token, dt) {
+  const today = todayLocalDt();
+  const cacheKey = `vidreuse-day-${dt}`;
+  if (dt < today) {
+    const c = diskGet(cacheKey);
+    if (c) return c;
+  }
+  // 1) 일별 온라인+문제해결 list 페이지네이션
+  const listItems = [];
+  const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=QA110002&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  listItems.push(...(first.data.contents || []));
+  const pages = Math.ceil((first.data.totalCount || 0) / PAGE_SIZE);
+  for (let p = 2; p <= pages; p++) {
+    const body = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=QA110002&questionStatusCommonCode=QA120004&searchType=taName`, token);
+    listItems.push(...(body.data.contents || []));
+  }
+  // 2) 각 question의 detail에서 비디오 첨부만 추출 (병렬)
+  const enriched = await parallelMap(listItems, async (item) => {
+    if (!item.taId && !item.taName) return null;
+    try {
+      const body = await get(`/v1/qna/${item.qnaQuestionMasterSerialNo}`, token);
+      const d = body.data || {};
+      const videos = (d.answerFiles || []).filter(f => isVideoFile(f.fileName));
+      if (videos.length === 0) return null;
+      const qd = item.questionDetails?.[0] || {};
+      return {
+        masterSerialNo: item.qnaQuestionMasterSerialNo,
+        taId: item.taId || '',
+        taName: item.taName || '',
+        registerAt: item.registerAt || '',
+        subjectDomain: qd.erpSubjectDomainCodeName || '',
+        subjectClass: qd.erpSubjectClassificationCodeName || '',
+        contents: qd.questionContsNm || '',
+        turnOrd: qd.questionTurnOrd ?? '',
+        problemNo: qd.questionExampprAnssheetNo ?? '',
+        videoFiles: videos.map(f => ({
+          filePathways: f.filePathways,
+          fileName: f.fileName,
+          qnaFileSerialNo: f.qnaFileSerialNo,
+        })),
+      };
+    } catch { return null; }
+  }, CONCURRENCY);
+  const result = enriched.filter(x => x !== null);
+  if (dt < today) diskSet(cacheKey, result);
+  return result;
+}
+
+async function fetchVideoReuse(token, startDt, endDt) {
+  // 31일 제한
+  const startDays = dtToDays(startDt);
+  const endDays = dtToDays(endDt);
+  if (endDays < startDays) throw new Error('시작일이 종료일보다 이후입니다.');
+  if (endDays - startDays > 30) throw new Error('조회 기간은 최대 31일입니다.');
+
+  // 일별 수집 (병렬 3)
+  const dates = [];
+  for (let d = startDays; d <= endDays; d++) dates.push(daysToDt(d));
+  const dayResults = await parallelMap(dates, (dt) => fetchDayVideoFiles(token, dt), 3);
+  const dayItems = dayResults.flat();
+
+  // 첨부 평면화 + (masterSerialNo, qnaFileSerialNo) dedup (페이지네이션 보호)
+  const seen = new Set();
+  const attachments = [];
+  for (const q of dayItems) {
+    for (const f of q.videoFiles) {
+      const k = `${q.masterSerialNo}|${f.qnaFileSerialNo}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      attachments.push({
+        url: buildAttachmentUrl(f.filePathways, f.fileName),
+        fileName: f.fileName,
+        masterSerialNo: q.masterSerialNo,
+        taId: q.taId,
+        taName: q.taName,
+        registerAt: q.registerAt,
+        subjectDomain: q.subjectDomain,
+        subjectClass: q.subjectClass,
+        contents: q.contents,
+        turnOrd: q.turnOrd,
+        problemNo: q.problemNo,
+      });
+    }
+  }
+
+  // HEAD로 ETag (병렬 20)
+  const heads = await parallelMap(attachments, async (a) => {
+    const h = await fetchHead(a.url);
+    return { ...a, etag: h.etag || null, contentLength: h.contentLength || 0, headError: h.error || null };
+  }, CONCURRENCY);
+
+  // ETag 그룹핑
+  const byEtag = new Map();
+  for (const h of heads) {
+    if (!h.etag) continue;
+    if (!byEtag.has(h.etag)) byEtag.set(h.etag, []);
+    byEtag.get(h.etag).push(h);
+  }
+
+  // TA별 재활용 파일 모으기 (같은 TA의 ETag가 ≥2회, masterSerialNo dedup 후도 ≥2)
+  const taAgg = new Map();
+  for (const [etag, group] of byEtag) {
+    if (group.length < 2) continue;
+    // TA별 분리
+    const byTa = new Map();
+    for (const h of group) {
+      if (!byTa.has(h.taId)) byTa.set(h.taId, []);
+      byTa.get(h.taId).push(h);
+    }
+    for (const [taId, subset] of byTa) {
+      if (subset.length < 2) continue;
+      // masterSerialNo dedup
+      const byQ = new Map();
+      for (const h of subset) {
+        if (!byQ.has(h.masterSerialNo)) byQ.set(h.masterSerialNo, h);
+      }
+      const deduped = [...byQ.values()].sort((a, b) => (a.registerAt || '').localeCompare(b.registerAt || ''));
+      if (deduped.length < 2) continue;
+
+      const original = deduped[0];
+      const reuses = deduped.slice(1);
+
+      const agg = taAgg.get(taId) || {
+        taId,
+        taName: original.taName,
+        originalCount: 0,
+        totalUses: 0,
+        files: [],
+      };
+      agg.taName = agg.taName || original.taName;
+      agg.originalCount += 1;
+      agg.totalUses += deduped.length;
+      agg.files.push({
+        fileName: original.fileName,
+        url: original.url,
+        contentLength: original.contentLength,
+        etag,
+        totalUses: deduped.length,
+        original: pickMeta(original),
+        reuses: reuses.map(pickMeta),
+      });
+      taAgg.set(taId, agg);
+    }
+  }
+
+  const taList = [...taAgg.values()].map(t => {
+    // 파일들은 재사용 횟수 내림차순
+    t.files.sort((a, b) => b.totalUses - a.totalUses);
+    return { ...t, extraUses: t.totalUses - t.originalCount };
+  }).sort((a, b) => b.extraUses - a.extraUses);
+
+  const totalOriginals = taList.reduce((s, t) => s + t.originalCount, 0);
+  const totalUses = taList.reduce((s, t) => s + t.totalUses, 0);
+  const totalExtra = taList.reduce((s, t) => s + t.extraUses, 0);
+
+  return {
+    period: { start: startDt, end: endDt },
+    totalAttachments: heads.length,
+    totalQuestionsWithVideo: dayItems.length,
+    totalOriginals,
+    totalUses,
+    totalExtra,
+    taCount: taList.length,
+    taList,
+  };
+}
+
+function pickMeta(h) {
+  return {
+    masterSerialNo: h.masterSerialNo,
+    registerAt: h.registerAt,
+    subjectDomain: h.subjectDomain,
+    subjectClass: h.subjectClass,
+    contents: h.contents,
+    turnOrd: h.turnOrd,
+    problemNo: h.problemNo,
   };
 }
 
@@ -610,6 +814,14 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/video-reuse') {
+    const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
+    if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
+    try { json(res, 200, await cached(`vidreuse:${start}:${end}`, () => fetchVideoReuse(token, start, end))); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/ai-status') {
     const token = url.searchParams.get('token');
     const startMonth = url.searchParams.get('start');
@@ -784,6 +996,7 @@ const HTML = `<!DOCTYPE html>
     <div class="tab" onclick="switchTab('perf')">TA 성과</div>
     <div class="tab" onclick="switchTab('ai')">AI 현황 보고</div>
     <div class="tab" onclick="switchTab('voucher')">바우처 내역 확인</div>
+    <div class="tab" onclick="switchTab('vidreuse')">동영상 재활용</div>
   </div>
 
   <!-- 답변불가 리포트 -->
@@ -851,6 +1064,17 @@ const HTML = `<!DOCTYPE html>
     </div>
     <div id="voucherStatus"></div>
   </div>
+
+  <!-- 동영상 재활용 -->
+  <div class="page" id="page-vidreuse">
+    <div class="ctrl">
+      <input type="date" id="vrStartDt"> <span>~</span> <input type="date" id="vrEndDt">
+      <button class="btn" id="vrBtn" onclick="doVideoReuse()">조회</button>
+      <button class="btn ex" id="vrCsvBtn" style="display:none" onclick="exportVideoReuseCsv()">엑셀 내보내기</button>
+      <span style="color:#888;font-size:12px;margin-left:8px">최대 31일 · 첫 조회 수 분 소요 · 재조회는 빠름</span>
+    </div>
+    <div id="vrResult"></div>
+  </div>
 </div>
 
 <script>
@@ -909,6 +1133,8 @@ function initApp() {
   document.getElementById('endDt').value = now.toISOString().slice(0, 10);
   document.getElementById('perfStart').value = ym + '-01';
   document.getElementById('perfEnd').value = now.toISOString().slice(0, 10);
+  document.getElementById('vrStartDt').value = ym + '-01';
+  document.getElementById('vrEndDt').value = now.toISOString().slice(0, 10);
   schYear = now.getFullYear();
   schMonth = now.getMonth() + 1;
   updateMonthLabel();
@@ -1417,6 +1643,141 @@ function renderAiDailyChart(daily) {
       },
     },
   });
+}
+
+// ── 동영상 재활용 ──
+
+let lastVideoReuseData = null;
+
+async function doVideoReuse() {
+  const s = document.getElementById('vrStartDt').value, e = document.getElementById('vrEndDt').value;
+  if (!s || !e || !TOKEN) return;
+  const diff = Math.round((new Date(e) - new Date(s)) / 86400000);
+  if (diff < 0) { document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">시작일이 종료일보다 이후입니다.</div>'; return; }
+  if (diff > 30) { document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">조회 기간은 최대 31일입니다.</div>'; return; }
+  const btn = document.getElementById('vrBtn');
+  btn.disabled = true; btn.textContent = '조회 중...';
+  document.getElementById('vrCsvBtn').style.display = 'none';
+  document.getElementById('vrResult').innerHTML = '<div class="loading">동영상 답변 추출 + ETag 확인 중... (첫 조회 시 수 분 소요)</div>';
+  try {
+    const res = await fetch('/api/video-reuse?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+    lastVideoReuseData = await res.json();
+    renderVideoReuse(lastVideoReuseData);
+    document.getElementById('vrCsvBtn').style.display = '';
+  } catch (err) {
+    document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = '조회';
+}
+
+function renderVideoReuse(d) {
+  let h = '<div class="cards">' +
+    '<div class="card"><div class="lb">동영상 답변 (조회 기간)</div><div class="vl">' + d.totalAttachments + '건</div></div>' +
+    '<div class="card"><div class="lb">재활용 원본 영상</div><div class="vl">' + d.totalOriginals + '개</div></div>' +
+    '<div class="card"><div class="lb">꽁 답변 (D-C)</div><div class="vl hl">' + d.totalExtra + '건</div></div>' +
+    '<div class="card"><div class="lb">해당 TA 수</div><div class="vl">' + d.taCount + '명</div></div>' +
+    '</div>';
+  if (d.taList.length === 0) {
+    h += '<div class="section" style="text-align:center;color:#888">재활용 패턴 없음</div>';
+    document.getElementById('vrResult').innerHTML = h;
+    return;
+  }
+  h += '<table id="vrTable"><thead><tr>' +
+    '<th>#</th><th>TA ID</th><th>TA 이름</th>' +
+    '<th style="text-align:right">원본 수 (C)</th>' +
+    '<th style="text-align:right">활용 답변 (D)</th>' +
+    '<th style="text-align:right">꽁 (D-C)</th>' +
+    '</tr></thead><tbody>';
+  d.taList.forEach((t, i) => {
+    h += '<tr class="vr-row" onclick="toggleVrDetail(' + i + ')" style="cursor:pointer">' +
+      '<td>' + (i+1) + '</td>' +
+      '<td style="color:#1d4ed8;text-decoration:underline">' + esc(t.taId) + '</td>' +
+      '<td>' + esc(t.taName) + '</td>' +
+      '<td class="r">' + t.originalCount + '</td>' +
+      '<td class="r">' + t.totalUses + '</td>' +
+      '<td class="r" style="color:#e53e3e">' + t.extraUses + '</td>' +
+      '</tr>';
+    h += '<tr id="vrDetail-' + i + '" style="display:none"><td colspan="6" style="background:#fafafa;padding:16px 24px">' +
+      renderVrDetail(t) + '</td></tr>';
+  });
+  h += '</tbody></table>';
+  document.getElementById('vrResult').innerHTML = h;
+}
+
+function renderVrDetail(t) {
+  if (!t.files || t.files.length === 0) return '<div style="color:#888">상세 없음</div>';
+  let h = '<div style="font-size:13px;color:#666;margin-bottom:8px">' + esc(t.taId) + ' (' + esc(t.taName) + ') · 재활용 영상 ' + t.files.length + '개</div>';
+  h += '<table style="background:#fff;width:100%"><thead><tr>' +
+    '<th>#</th><th>원본 영상</th><th style="text-align:right">크기</th><th style="text-align:right">사용 횟수</th>' +
+    '<th>원본 질문</th><th>재활용 질문 ID</th></tr></thead><tbody>';
+  t.files.forEach((f, i) => {
+    const sizeMb = f.contentLength ? (f.contentLength / 1024 / 1024).toFixed(1) + 'MB' : '-';
+    const origLink = adminLink(f.original.masterSerialNo);
+    const origMeta = vrMetaLabel(f.original);
+    const reuseLinks = f.reuses.map(r => adminLink(r.masterSerialNo)).join(', ');
+    h += '<tr>' +
+      '<td>' + (i+1) + '</td>' +
+      '<td><a href="' + esc(f.url) + '" target="_blank" style="color:#1d4ed8;text-decoration:underline;font-size:12px">' + esc(f.fileName) + '</a></td>' +
+      '<td class="r">' + sizeMb + '</td>' +
+      '<td class="r">' + f.totalUses + '회</td>' +
+      '<td style="font-size:12px">' + origLink + ' <span style="color:#888">· ' + esc(origMeta) + '</span></td>' +
+      '<td style="font-size:12px;line-height:1.6">' + reuseLinks + '</td>' +
+      '</tr>';
+  });
+  h += '</tbody></table>';
+  return h;
+}
+
+function adminLink(id) {
+  return '<a href="https://qna-admin.hiconsysvc.com/qna/' + id + '" target="_blank" style="color:#1d4ed8;text-decoration:underline">#' + id + '</a>';
+}
+function vrMetaLabel(m) {
+  if (!m) return '';
+  const parts = [];
+  if (m.registerAt) parts.push(m.registerAt.slice(0, 16));
+  if (m.subjectClass) parts.push(m.subjectClass);
+  if (m.contents) parts.push(m.contents);
+  return parts.join(' · ');
+}
+
+function toggleVrDetail(i) {
+  const row = document.getElementById('vrDetail-' + i);
+  if (!row) return;
+  row.style.display = row.style.display === 'none' ? '' : 'none';
+}
+
+function exportVideoReuseCsv() {
+  if (!lastVideoReuseData) return;
+  const d = lastVideoReuseData;
+  // 두 시트 합본 형식: 헤더 → 요약 표 → (빈 줄) → 파일별 상세
+  const rows = [];
+  rows.push(['TA ID', 'TA 이름', '원본 수 (C)', '활용 답변 (D)', '꽁 (D-C)']);
+  d.taList.forEach(t => rows.push([t.taId, t.taName, t.originalCount, t.totalUses, t.extraUses]));
+  rows.push([]);
+  rows.push(['', '== 영상별 상세 ==']);
+  rows.push(['TA ID', 'TA 이름', '원본 파일명', '크기(MB)', '사용 횟수', '원본 질문ID', '원본 등록일시', '원본 컨텐츠', '재활용 질문 IDs']);
+  d.taList.forEach(t => {
+    (t.files || []).forEach(f => {
+      const sizeMb = f.contentLength ? (f.contentLength / 1024 / 1024).toFixed(2) : '';
+      const reuseIds = (f.reuses || []).map(r => r.masterSerialNo).join(' ');
+      rows.push([
+        t.taId, t.taName, f.fileName, sizeMb, f.totalUses,
+        f.original.masterSerialNo, f.original.registerAt || '',
+        [f.original.subjectClass, f.original.contents].filter(Boolean).join(' / '),
+        reuseIds,
+      ]);
+    });
+  });
+  const csv = rows.map(r => r.map(c => {
+    const s = c == null ? '' : String(c);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '동영상재활용_' + d.period.start + '_' + d.period.end + '.csv';
+  a.click();
 }
 
 // Enter 키
