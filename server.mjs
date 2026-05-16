@@ -796,7 +796,20 @@ const server = createServer(async (req, res) => {
 
   if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(req.method === 'HEAD' ? undefined : 'ok');
+    res.end(req.method === 'HEAD' ? undefined : `ok\nupstash=${UPSTASH_ENABLED ? 'on' : 'off'}`);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/cache-ping') {
+    if (!UPSTASH_ENABLED) { json(res, 200, { upstash: 'off' }); return; }
+    try {
+      const testKey = 'cacheping-' + Date.now();
+      upstashSet(testKey, { ts: Date.now() });
+      // 짧은 딜레이 후 read-back
+      await new Promise(r => setTimeout(r, 200));
+      const back = await upstashGet(testKey);
+      json(res, 200, { upstash: 'on', writeReadOk: back != null, value: back });
+    } catch (e) { json(res, 500, { upstash: 'on', error: e.message }); }
     return;
   }
 
