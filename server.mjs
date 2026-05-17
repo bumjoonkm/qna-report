@@ -319,16 +319,29 @@ async function fetchPerformance(token, startDt, endDt) {
 
 // ── 동영상 재활용 ──
 
-// 하루치: 온라인 + 문제해결 질문의 비디오 첨부만 추출. 과거일은 디스크 캐시.
+// 캐시 정책: 과거일(< today)은 영구. 오늘일(== today)은 30분 stale 허용.
+// envelope 포맷 {savedAt, data}로 저장. 옛 array 포맷도 읽기 호환.
+const VIDREUSE_DAY_TODAY_TTL_MS = 30 * 60 * 1000;
+const VIDREUSE_RESULT_TODAY_TTL_MS = 60 * 60 * 1000;
+
+// 하루치: 온라인 + 문제해결 질문의 비디오 첨부만 추출. 디스크 캐시 + Upstash 영속.
 // 캐시 entry에 HEAD 결과(etag/contentLength)까지 박아둬서 재검색 시 HEAD 재호출 안 함.
-// 파일 URL은 immutable이라 한 번 채우면 변하지 않음. (v2: HEAD 포함)
+// 파일 URL은 immutable이라 한 번 채우면 변하지 않음.
 async function fetchDayVideoFiles(token, dt) {
   const today = todayLocalDt();
   const cacheKey = `vidreuse-day-v2-${dt}`;
-  if (dt < today) {
-    const c = await diskGet(cacheKey);
-    if (c) return c;
+  const isPast = dt < today;
+
+  const c = await diskGet(cacheKey);
+  if (c) {
+    if (Array.isArray(c)) {
+      // 옛 포맷 (과거일만 저장됐었음) — 영구 hit
+      if (isPast) return c;
+    } else if (c && typeof c.savedAt === 'number' && Array.isArray(c.data)) {
+      if (isPast || Date.now() - c.savedAt < VIDREUSE_DAY_TODAY_TTL_MS) return c.data;
+    }
   }
+
   // 1) 일별 온라인+문제해결 list 페이지네이션
   const listItems = [];
   const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=QA110002&questionStatusCommonCode=QA120004&searchType=taName`, token);
@@ -376,16 +389,15 @@ async function fetchDayVideoFiles(token, dt) {
     f.contentLength = h.contentLength || 0;
     if (h.error) f.headError = h.error;
   }, CONCURRENCY);
-  if (dt < today) diskSet(cacheKey, result);
+  // 과거일은 무기한 / 오늘일은 30분 stale 허용. 둘 다 envelope 포맷으로 저장.
+  diskSet(cacheKey, { savedAt: Date.now(), data: result });
   return result;
 }
 
 async function fetchVideoReuse(token, startDt, endDt) {
-  // 31일 제한
   const startDays = dtToDays(startDt);
   const endDays = dtToDays(endDt);
   if (endDays < startDays) throw new Error('시작일이 종료일보다 이후입니다.');
-  if (endDays - startDays > 30) throw new Error('조회 기간은 최대 31일입니다.');
 
   // 일별 수집 (병렬 3)
   const dates = [];
@@ -878,17 +890,33 @@ const server = createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/video-reuse') {
     const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
+    const fresh = url.searchParams.get('fresh') === '1';
     if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
     try {
       const today = todayLocalDt();
       const resultKey = `vidreuse-result-${start}-${end}`;
-      // 과거 완료 기간이면 Upstash 결과 캐시 우선 (dyno 재시작 후에도 유지)
-      if (end < today) {
+      const includesTodayOrFuture = end >= today;
+      // 결과 캐시: 과거 완료 기간 영구, 오늘 포함 기간 1시간 stale 허용. fresh=1 이면 무시.
+      if (!fresh) {
         const hit = await diskGet(resultKey);
-        if (hit) { json(res, 200, hit); return; }
+        if (hit) {
+          if (hit && typeof hit.savedAt === 'number' && hit.data && hit.data.taList) {
+            const age = Date.now() - hit.savedAt;
+            if (!includesTodayOrFuture || age < VIDREUSE_RESULT_TODAY_TTL_MS) {
+              json(res, 200, { ...hit.data, _cached: 'server', _cacheSavedAt: hit.savedAt, _cacheAgeMs: age });
+              return;
+            }
+          } else if (hit && hit.taList) {
+            // 옛 포맷 (과거에만 저장됐었음): savedAt 없음. 과거 기간이면 영구 hit.
+            if (!includesTodayOrFuture) {
+              json(res, 200, { ...hit, _cached: 'server', _cacheSavedAt: null, _cacheAgeMs: null });
+              return;
+            }
+          }
+        }
       }
       const data = await cached(`vidreuse:${start}:${end}`, () => fetchVideoReuse(token, start, end));
-      if (end < today) diskSet(resultKey, data);
+      diskSet(resultKey, { savedAt: Date.now(), data });
       json(res, 200, data);
     } catch (e) { json(res, 500, { error: e.message }); }
     return;
@@ -1114,6 +1142,9 @@ const HTML = `<!DOCTYPE html>
       <select id="aiMonthB"></select> <span>월까지</span>
       <input type="number" id="aiDays" min="1" max="365" value="7" style="width:60px"> <span>일 간격</span>
       <button class="btn" id="aiBtn" onclick="doAiStatus()">조회</button>
+      <span style="margin-left:12px;color:#888;font-size:12px">표시:</span>
+      <label style="font-size:13px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="aiShowMoney" checked onchange="redrawAiChart()"> 금액</label>
+      <label style="font-size:13px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="aiShowDelta" checked onchange="redrawAiChart()"> 증감률</label>
     </div>
     <div class="section" style="padding:24px">
       <h2 id="aiChartTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:8px"></h2>
@@ -1143,7 +1174,7 @@ const HTML = `<!DOCTYPE html>
       <input type="date" id="vrStartDt"> <span>~</span> <input type="date" id="vrEndDt">
       <button class="btn" id="vrBtn" onclick="doVideoReuse()">조회</button>
       <button class="btn ex" id="vrCsvBtn" style="display:none" onclick="exportVideoReuseCsv()">엑셀 내보내기</button>
-      <span style="color:#888;font-size:12px;margin-left:8px">최대 31일 · 첫 조회 수 분 소요 · 재조회는 빠름</span>
+      <span style="color:#888;font-size:12px;margin-left:8px">첫 조회는 기간에 비례해서 오래 걸려요 · 같은 조건 재조회는 캐시로 즉시 표시</span>
     </div>
     <div id="vrResult"></div>
   </div>
@@ -1524,6 +1555,8 @@ const stackTotalsPlugin = {
   afterDatasetsDraw(chart) {
     const { ctx, data } = chart;
     const periods = chart.config._aiPeriods || [];
+    const showMoney = chart.config._showMoney !== false;
+    const showDelta = chart.config._showDelta !== false;
     ctx.save();
     ctx.textAlign = 'center';
     data.labels.forEach((_, i) => {
@@ -1544,17 +1577,19 @@ const stackTotalsPlugin = {
       if (stacks.gRef)  ctx.fillText('총 ' + stacks.gRef.total.toLocaleString()  + '건', stacks.gRef.x,  stacks.gRef.y  - 8);
       const period = periods[i];
       if (!period) return;
-      ctx.font = 'bold 11px sans-serif';
-      ctx.fillStyle = '#333';
-      if (stacks.gPrev && period.costPrev > 0) {
-        ctx.fillText('₩' + period.costPrev.toLocaleString(), stacks.gPrev.x, stacks.gPrev.y - 26);
+      if (showMoney) {
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillStyle = '#333';
+        if (stacks.gPrev && period.costPrev > 0) {
+          ctx.fillText('₩' + period.costPrev.toLocaleString(), stacks.gPrev.x, stacks.gPrev.y - 26);
+        }
+        if (stacks.gRef && period.costRef > 0) {
+          ctx.fillText('₩' + period.costRef.toLocaleString(), stacks.gRef.x, stacks.gRef.y - 26);
+        }
       }
-      if (stacks.gRef && period.costRef > 0) {
-        ctx.fillText('₩' + period.costRef.toLocaleString(), stacks.gRef.x, stacks.gRef.y - 26);
-      }
-      if (period.savingsPct !== null && stacks.gPrev && stacks.gRef) {
+      if (showDelta && period.savingsPct !== null && stacks.gPrev && stacks.gRef) {
         const cx = (stacks.gPrev.x + stacks.gRef.x) / 2;
-        const cy = Math.min(stacks.gPrev.y, stacks.gRef.y) - 54;
+        const cy = Math.min(stacks.gPrev.y, stacks.gRef.y) - (showMoney ? 54 : 26);
         const pct = period.savingsPct;
         const label = pct >= 0 ? pct.toFixed(1) + '% 감축' : Math.abs(pct).toFixed(1) + '% 증가';
         ctx.fillStyle = pct >= 0 ? '#D9534F' : '#888';
@@ -1668,6 +1703,15 @@ function renderAiChart(data) {
     plugins: [ChartDataLabels, stackTotalsPlugin],
   });
   aiChartInstance.config._aiPeriods = periods;
+  aiChartInstance.config._showMoney = document.getElementById('aiShowMoney') ? document.getElementById('aiShowMoney').checked : true;
+  aiChartInstance.config._showDelta = document.getElementById('aiShowDelta') ? document.getElementById('aiShowDelta').checked : true;
+  aiChartInstance.update();
+}
+
+function redrawAiChart() {
+  if (!aiChartInstance) return;
+  aiChartInstance.config._showMoney = document.getElementById('aiShowMoney').checked;
+  aiChartInstance.config._showDelta = document.getElementById('aiShowDelta').checked;
   aiChartInstance.update();
 }
 
@@ -1721,21 +1765,101 @@ function renderAiDailyChart(daily) {
 
 let lastVideoReuseData = null;
 
-async function doVideoReuse() {
+// 클라이언트 측 영속 캐시 — 브라우저 새로고침/탭 전환에도 즉시 표시
+const VR_LOCAL_PREFIX = 'vrCache:';
+const VR_LOCAL_TODAY_TTL_MS = 60 * 60 * 1000;
+const VR_LOCAL_MAX_ENTRIES = 30;
+
+function vrTodayStr() {
+  const n = new Date();
+  return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
+}
+function loadVrLocalCache(s, e) {
+  try {
+    const raw = localStorage.getItem(VR_LOCAL_PREFIX + s + ':' + e);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.data || typeof obj.savedAt !== 'number') return null;
+    const today = vrTodayStr();
+    if (e < today) return obj; // 과거 기간: 영구 hit
+    if (Date.now() - obj.savedAt < VR_LOCAL_TODAY_TTL_MS) return obj;
+    return null;
+  } catch { return null; }
+}
+function saveVrLocalCache(s, e, data) {
+  try {
+    localStorage.setItem(VR_LOCAL_PREFIX + s + ':' + e, JSON.stringify({ savedAt: Date.now(), data }));
+  } catch {
+    pruneVrLocalCache(true);
+    try { localStorage.setItem(VR_LOCAL_PREFIX + s + ':' + e, JSON.stringify({ savedAt: Date.now(), data })); } catch {}
+  }
+}
+function pruneVrLocalCache(aggressive) {
+  try {
+    const all = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(VR_LOCAL_PREFIX)) continue;
+      try {
+        const obj = JSON.parse(localStorage.getItem(k));
+        all.push({ k, savedAt: (obj && obj.savedAt) || 0 });
+      } catch { localStorage.removeItem(k); }
+    }
+    all.sort((a, b) => b.savedAt - a.savedAt);
+    const limit = aggressive ? Math.floor(VR_LOCAL_MAX_ENTRIES / 2) : VR_LOCAL_MAX_ENTRIES;
+    const cutoff = Date.now() - 30 * 86400000;
+    all.forEach((entry, i) => {
+      if (entry.savedAt < cutoff || i >= limit) localStorage.removeItem(entry.k);
+    });
+  } catch {}
+}
+function clearVrLocalCache(s, e) {
+  try { localStorage.removeItem(VR_LOCAL_PREFIX + s + ':' + e); } catch {}
+}
+function vrAgeLabel(savedAt) {
+  if (!savedAt) return '저장된 결과';
+  const secs = Math.max(0, Math.round((Date.now() - savedAt) / 1000));
+  if (secs < 60) return secs + '초 전';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return mins + '분 전';
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return hours + '시간 전';
+  return Math.round(hours / 24) + '일 전';
+}
+
+async function doVideoReuse(opts) {
+  const force = !!(opts && opts.force);
   const s = document.getElementById('vrStartDt').value, e = document.getElementById('vrEndDt').value;
   if (!s || !e || !TOKEN) return;
   const diff = Math.round((new Date(e) - new Date(s)) / 86400000);
   if (diff < 0) { document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">시작일이 종료일보다 이후입니다.</div>'; return; }
-  if (diff > 30) { document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">조회 기간은 최대 31일입니다.</div>'; return; }
+
+  // 1) 브라우저 캐시 hit → 즉시 표시 (서버 왕복 0)
+  if (!force) {
+    const lc = loadVrLocalCache(s, e);
+    if (lc) {
+      lastVideoReuseData = lc.data;
+      renderVideoReuse(lc.data, { source: 'local', savedAt: lc.savedAt });
+      document.getElementById('vrCsvBtn').style.display = '';
+      return;
+    }
+  }
+
   const btn = document.getElementById('vrBtn');
   btn.disabled = true; btn.textContent = '조회 중...';
   document.getElementById('vrCsvBtn').style.display = 'none';
-  document.getElementById('vrResult').innerHTML = '<div class="loading">동영상 답변 추출 + ETag 확인 중... (첫 조회 시 수 분 소요)</div>';
+  document.getElementById('vrResult').innerHTML = '<div class="loading">동영상 답변 추출 + ETag 확인 중... (첫 조회 시 수 분 소요, 이후 캐시로 즉시 표시)</div>';
   try {
-    const res = await fetch('/api/video-reuse?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
+    const qs = '/api/video-reuse?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e + (force ? '&fresh=1' : '');
+    const res = await fetch(qs);
     if (!res.ok) { const t = await res.text(); throw new Error(t); }
-    lastVideoReuseData = await res.json();
-    renderVideoReuse(lastVideoReuseData);
+    const data = await res.json();
+    lastVideoReuseData = data;
+    saveVrLocalCache(s, e, data);
+    const banner = data._cached === 'server'
+      ? { source: 'server', savedAt: data._cacheSavedAt }
+      : null;
+    renderVideoReuse(data, banner);
     document.getElementById('vrCsvBtn').style.display = '';
   } catch (err) {
     document.getElementById('vrResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
@@ -1743,8 +1867,26 @@ async function doVideoReuse() {
   btn.disabled = false; btn.textContent = '조회';
 }
 
-function renderVideoReuse(d) {
-  let h = '<div class="cards">' +
+function refreshVrCache() {
+  const s = document.getElementById('vrStartDt').value, e = document.getElementById('vrEndDt').value;
+  if (s && e) clearVrLocalCache(s, e);
+  doVideoReuse({ force: true });
+}
+
+function renderVideoReuse(d, banner) {
+  let h = '';
+  if (banner && banner.source === 'local') {
+    h += '<div style="background:#ecfdf5;border:1px solid #6ee7b7;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:12px">'
+      + '<span style="color:#065f46">브라우저 캐시에서 즉시 표시 (' + esc(vrAgeLabel(banner.savedAt)) + ' 조회). 같은 조건은 다시 받지 않아 빠릅니다.</span>'
+      + '<button onclick="refreshVrCache()" style="background:#fff;border:1px solid #059669;color:#065f46;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap">새로 조회</button>'
+      + '</div>';
+  } else if (banner && banner.source === 'server') {
+    h += '<div style="background:#eff6ff;border:1px solid #93c5fd;padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:12px">'
+      + '<span style="color:#1e3a8a">서버 캐시에서 즉시 표시 (' + esc(vrAgeLabel(banner.savedAt)) + ' 저장). 데이터 갱신은 우측 버튼.</span>'
+      + '<button onclick="refreshVrCache()" style="background:#fff;border:1px solid #2563eb;color:#1e3a8a;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap">새로 조회</button>'
+      + '</div>';
+  }
+  h += '<div class="cards">' +
     '<div class="card"><div class="lb">동영상 답변 (조회 기간)</div><div class="vl">' + d.totalAttachments + '건</div></div>' +
     '<div class="card"><div class="lb">재활용 원본 영상</div><div class="vl">' + d.totalOriginals + '개</div></div>' +
     '<div class="card"><div class="lb">꽁 답변 (D-C)</div><div class="vl hl">' + d.totalExtra + '건</div></div>' +
