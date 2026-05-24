@@ -317,6 +317,91 @@ async function fetchPerformance(token, startDt, endDt) {
   };
 }
 
+// ── 별점 비교 (25 vs 26) ──
+
+// (date, division) 1일치: 리뷰 starScores 배열 + 해결완료 totalCount.
+// 과거일만 디스크 캐시 (immutable). 오늘일은 매번 fresh.
+async function fetchRatingDay(token, dt, division) {
+  const today = todayLocalDt();
+  const cacheKey = `rating-day-v1-${division}-${dt}`;
+  const isPast = dt < today;
+  if (isPast) {
+    const c = await diskGet(cacheKey);
+    if (c) return c;
+  }
+  // 1) /v1/review/list 페이지네이션 → starScores 모음
+  const starScores = [];
+  const first = await get(`/v1/review/list?page=1&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&searchType=memberName`, token);
+  const fd = first?.data || {};
+  const reviewTotal = fd.totalElements ?? fd.totalCount ?? fd.total ?? 0;
+  for (const r of (fd.contents || [])) if (r.starScore != null) starScores.push(r.starScore);
+  const pages = Math.ceil(reviewTotal / PAGE_SIZE);
+  for (let p = 2; p <= pages; p++) {
+    const body = await get(`/v1/review/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&searchType=memberName`, token);
+    for (const r of (body?.data?.contents || [])) if (r.starScore != null) starScores.push(r.starScore);
+  }
+  // 2) 해결완료 분모 — /v1/qna/list?pageSize=1로 totalCount만
+  const cnt = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  const cd = cnt?.data || {};
+  const resolvedCount = cd.totalElements ?? cd.totalCount ?? cd.total ?? 0;
+
+  const result = { starScores, resolvedCount };
+  if (isPast) diskSet(cacheKey, result);
+  return result;
+}
+
+async function fetchRatingComparison(token, startDt, endDt) {
+  const today = todayLocalDt();
+  const refEnd = endDt > today ? today : endDt;
+  const refStart = startDt;
+  const refYear = parseInt(refStart.split('-')[0]);
+  const [prevPeriod] = shiftYearTo([{ start: refStart, end: refEnd }], refYear - 1);
+
+  const refDates = [];
+  for (let d = dtToDays(refStart); d <= dtToDays(refEnd); d++) refDates.push(daysToDt(d));
+  const prevDates = [];
+  for (let d = dtToDays(prevPeriod.start); d <= dtToDays(prevPeriod.end); d++) prevDates.push(daysToDt(d));
+
+  const divisions = ['QA110001', 'QA110002'];
+  const tasks = [];
+  for (const dt of refDates) for (const div of divisions) tasks.push({ year: 'ref', dt, div });
+  for (const dt of prevDates) for (const div of divisions) tasks.push({ year: 'prev', dt, div });
+  const results = await parallelMap(tasks, async (t) => {
+    const r = await fetchRatingDay(token, t.dt, t.div);
+    return { ...t, ...r };
+  }, CONCURRENCY);
+
+  function aggregate(filterFn) {
+    const subset = results.filter(filterFn);
+    const allStars = subset.flatMap(s => s.starScores);
+    const n = allStars.length;
+    const sum = allStars.reduce((a, b) => a + b, 0);
+    const positive = allStars.filter(s => s === 5).length;
+    const negative = allStars.filter(s => s === 1 || s === 2).length;
+    return {
+      avgStar: n > 0 ? +(sum / n).toFixed(2) : null,
+      resolvedCount: subset.reduce((s, r) => s + r.resolvedCount, 0),
+      reviewCount: n,
+      positiveRate: n > 0 ? +((positive / n) * 100).toFixed(1) : null,
+      negativeRate: n > 0 ? +((negative / n) * 100).toFixed(1) : null,
+    };
+  }
+
+  return {
+    refYear, prevYear: refYear - 1,
+    refPeriod: { start: refStart, end: refEnd },
+    prevPeriod: { start: prevPeriod.start, end: prevPeriod.end },
+    inPerson: {
+      prev: aggregate(r => r.year === 'prev' && r.div === 'QA110001'),
+      ref:  aggregate(r => r.year === 'ref'  && r.div === 'QA110001'),
+    },
+    online: {
+      prev: aggregate(r => r.year === 'prev' && r.div === 'QA110002'),
+      ref:  aggregate(r => r.year === 'ref'  && r.div === 'QA110002'),
+    },
+  };
+}
+
 // ── 동영상 재활용 ──
 
 // 캐시 정책: 과거일(< today)은 영구. 오늘일(== today)은 30분 stale 허용.
@@ -888,6 +973,16 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/rating-comparison') {
+    const token = url.searchParams.get('token');
+    const start = url.searchParams.get('start');
+    const end = url.searchParams.get('end');
+    if (!token || !start || !end) { json(res, 400, { error: 'token, start, end 필요' }); return; }
+    try { json(res, 200, await cached(`rating-cmp:${start}:${end}`, () => fetchRatingComparison(token, start, end))); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/video-reuse') {
     const token = url.searchParams.get('token'), start = url.searchParams.get('start'), end = url.searchParams.get('end');
     const fresh = url.searchParams.get('fresh') === '1';
@@ -1095,6 +1190,7 @@ const HTML = `<!DOCTYPE html>
     <div class="tab" onclick="switchTab('schedule')">TA Meet 스케줄표</div>
     <div class="tab" onclick="switchTab('perf')">TA 성과</div>
     <div class="tab" onclick="switchTab('ai')">AI 현황 보고</div>
+    <div class="tab" onclick="switchTab('rating')">별점 비교</div>
     <div class="tab" onclick="switchTab('voucher')">바우처 내역 확인</div>
     <div class="tab" onclick="switchTab('vidreuse')">동영상 재활용</div>
   </div>
@@ -1152,6 +1248,16 @@ const HTML = `<!DOCTYPE html>
       <h2 id="aiDailyChartTitle" style="font-size:16px;font-weight:600;color:#333;text-align:center;margin-top:24px;margin-bottom:12px"></h2>
       <canvas id="aiDailyRatioChart" height="80"></canvas>
     </div>
+  </div>
+
+  <!-- 별점 비교 -->
+  <div class="page" id="page-rating">
+    <div class="ctrl">
+      <input type="date" id="ratingStart"> <span>~</span> <input type="date" id="ratingEnd">
+      <button class="btn" id="ratingBtn" onclick="doRating()">조회</button>
+      <span style="color:#888;font-size:12px;margin-left:8px">25년 동일 MM-DD 자동 비교 · 26년 미래 일자는 today로 클램프</span>
+    </div>
+    <div id="ratingResult"></div>
   </div>
 
   <!-- 바우처 내역 확인 -->
@@ -1238,6 +1344,8 @@ function initApp() {
   document.getElementById('perfEnd').value = now.toISOString().slice(0, 10);
   document.getElementById('vrStartDt').value = ym + '-01';
   document.getElementById('vrEndDt').value = now.toISOString().slice(0, 10);
+  document.getElementById('ratingStart').value = ym + '-01';
+  document.getElementById('ratingEnd').value = now.toISOString().slice(0, 10);
   schYear = now.getFullYear();
   schMonth = now.getMonth() + 1;
   updateMonthLabel();
@@ -1312,6 +1420,50 @@ function doExport() {
 }
 
 // ── TA Meet 스케줄 ──
+
+// ── 별점 비교 ──
+
+async function doRating() {
+  const s = document.getElementById('ratingStart').value;
+  const e = document.getElementById('ratingEnd').value;
+  if (!s || !e || !TOKEN) return;
+  if (s > e) { alert('시작일 ≤ 종료일'); return; }
+  const btn = document.getElementById('ratingBtn');
+  btn.disabled = true; btn.textContent = '조회 중... (최초 조회는 시간이 걸려요)';
+  document.getElementById('ratingResult').innerHTML = '<div class="loading">별점 데이터 조회 중...</div>';
+  try {
+    const res = await fetch('/api/rating-comparison?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
+    if (!res.ok) throw new Error(await res.text());
+    renderRating(await res.json());
+  } catch (err) {
+    document.getElementById('ratingResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(err.message) + '</div>';
+  }
+  btn.disabled = false; btn.textContent = '조회';
+}
+
+function renderRating(d) {
+  const fmt = (v, suf) => v == null ? '-' : v + (suf || '');
+  const dateLabel = (year, p) => year + '년 ' + p.start.slice(5).replace('-', '/') + '~' + p.end.slice(5).replace('-', '/');
+  const row = (label, m) =>
+    '<tr><td>' + esc(label) + '</td>' +
+    '<td>' + fmt(m.avgStar) + '</td>' +
+    '<td>' + m.resolvedCount.toLocaleString() + '</td>' +
+    '<td>' + m.reviewCount.toLocaleString() + '</td>' +
+    '<td>' + fmt(m.positiveRate, '%') + '</td>' +
+    '<td>' + fmt(m.negativeRate, '%') + '</td></tr>';
+  let h = '';
+  h += '<div class="section"><h2>1. 대면 TA 상담</h2>';
+  h += '<table><thead><tr><th></th><th>평균 별점</th><th>상담 진행 횟수</th><th>리뷰완료 상담 수</th><th>긍정적 별점 비율</th><th>부정적 별점 비율</th></tr></thead><tbody>';
+  h += row(dateLabel(d.prevYear, d.prevPeriod), d.inPerson.prev);
+  h += row(dateLabel(d.refYear, d.refPeriod), d.inPerson.ref);
+  h += '</tbody></table></div>';
+  h += '<div class="section"><h2>2. 온라인 답변</h2>';
+  h += '<table><thead><tr><th></th><th>평균 별점</th><th>해결 완료 질문 수</th><th>리뷰완료 질문 수</th><th>긍정적 별점 비율</th><th>부정적 별점 비율</th></tr></thead><tbody>';
+  h += row(dateLabel(d.prevYear, d.prevPeriod), d.online.prev);
+  h += row(dateLabel(d.refYear, d.refPeriod), d.online.ref);
+  h += '</tbody></table></div>';
+  document.getElementById('ratingResult').innerHTML = h;
+}
 
 function updateMonthLabel() {
   document.getElementById('monthLabel').textContent = schYear + '년 ' + schMonth + '월';
