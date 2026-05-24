@@ -241,15 +241,16 @@ async function fetchSchedule(token, year, month, branchCode) {
       totalSlots += counts[dt][time];
     }
   }
-  return { year, month, branchCode, counts, salary: totalSlots * rate };
+  return { year, month, branchCode, counts, slots: totalSlots, salary: totalSlots * rate };
 }
 
 async function fetchSalaryAll(token, year, month) {
   const results = await Promise.all(
-    BRANCHES.map(b => fetchSchedule(token, year, month, b.code).then(r => ({ code: b.code, name: b.name, salary: r.salary })))
+    BRANCHES.map(b => fetchSchedule(token, year, month, b.code).then(r => ({ code: b.code, name: b.name, salary: r.salary, slots: r.slots })))
   );
   const total = results.reduce((s, r) => s + r.salary, 0);
-  return { year, month, branches: results, total };
+  const totalSlots = results.reduce((s, r) => s + r.slots, 0);
+  return { year, month, branches: results, total, totalSlots };
 }
 
 // ── TA 성과 ──
@@ -967,7 +968,7 @@ const server = createServer(async (req, res) => {
     const year = parseInt(url.searchParams.get('year'));
     const month = parseInt(url.searchParams.get('month'));
     if (!token || !year || !month) { json(res, 400, { error: 'token, year, month 필요' }); return; }
-    try { json(res, 200, await cached(`salary:${year}:${month}`, () => fetchSalaryAll(token, year, month))); }
+    try { json(res, 200, await cached(`salary:v2:${year}:${month}`, () => fetchSalaryAll(token, year, month))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -1508,10 +1509,11 @@ function renderSalary(sal) {
   const fmt = (n) => n.toLocaleString('ko-KR');
   let h = '<div class="cards" style="flex-wrap:wrap">';
   h += '<div class="card" style="border:2px solid #333"><div class="lb">TA Meet 급여 합계</div><div class="vl" style="font-size:24px">' + fmt(sal.total) + '원</div>';
+  h += '<div class="sm" style="margin-top:4px;color:#666">총 ' + fmt(sal.totalSlots) + '타임</div>';
   h += '<div class="sm" style="margin-top:8px">';
   sal.branches.forEach(b => {
     const rate = b.code === 'G1' ? '42,000' : '52,500';
-    h += esc(b.name) + ' ' + fmt(b.salary) + '원 <span style="color:#aaa">(' + rate + '원/타임)</span><br>';
+    h += esc(b.name) + ' ' + fmt(b.salary) + '원 · ' + fmt(b.slots) + '타임 <span style="color:#aaa">(' + rate + '원/타임)</span><br>';
   });
   h += '</div></div></div>';
   document.getElementById('salaryResult').innerHTML = h;
