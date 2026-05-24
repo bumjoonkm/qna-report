@@ -319,11 +319,17 @@ async function fetchPerformance(token, startDt, endDt) {
 
 // ── 별점 비교 (25 vs 26) ──
 
-// (date, division) 1일치: 리뷰 starScores 배열 + 해결완료 totalCount.
+// 대면(QA110001)은 TA Meet 답변완료(QA010009 + meetonYn=A), 온라인(QA110002)은 문제해결(QA120004).
+const RATING_DIV_STATUS = {
+  QA110001: 'QA010009&meetonYn=A',
+  QA110002: 'QA120004',
+};
+
+// (date, division) 1일치: 리뷰 starScores 배열 + 답변완료 totalCount.
 // 과거일만 디스크 캐시 (immutable). 오늘일은 매번 fresh.
 async function fetchRatingDay(token, dt, division) {
   const today = todayLocalDt();
-  const cacheKey = `rating-day-v1-${division}-${dt}`;
+  const cacheKey = `rating-day-v2-${division}-${dt}`;
   const isPast = dt < today;
   if (isPast) {
     const c = await diskGet(cacheKey);
@@ -340,8 +346,9 @@ async function fetchRatingDay(token, dt, division) {
     const body = await get(`/v1/review/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&searchType=memberName`, token);
     for (const r of (body?.data?.contents || [])) if (r.starScore != null) starScores.push(r.starScore);
   }
-  // 2) 해결완료 분모 — /v1/qna/list?pageSize=1로 totalCount만
-  const cnt = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&questionStatusCommonCode=QA120004&searchType=taName`, token);
+  // 2) 답변완료 분모 — division별로 status 코드 분기
+  const statusFrag = RATING_DIV_STATUS[division];
+  const cnt = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&questionStatusCommonCode=${statusFrag}&searchType=taName`, token);
   const cd = cnt?.data || {};
   const resolvedCount = cd.totalElements ?? cd.totalCount ?? cd.total ?? 0;
 
