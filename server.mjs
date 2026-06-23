@@ -1321,6 +1321,16 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // 검사 기록 초기화 → 현재 답변대기 백로그를 다음 틱에 다시 분류 (검증용)
+  if (req.method === 'POST' && url.pathname === '/api/monitor/reset') {
+    const body = JSON.parse(await readBody(req));
+    if (!body.token) { json(res, 401, { error: 'token 필요' }); return; }
+    diskSet('monitor:seen', []);
+    diskSet('monitor:log', []);
+    json(res, 200, { ok: true });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not Found');
 });
@@ -1560,6 +1570,7 @@ const HTML = `<!DOCTYPE html>
       <button class="btn" style="background:#c53030" onclick="setMonMode('auto')">자동 거절 켜기</button>
       <button class="btn ex" onclick="loadMonitor()">새로고침</button>
       <button class="btn" onclick="runMonTick()">지금 1회 검사</button>
+      <button class="btn" onclick="resetMonitor()">기록 초기화(재검사)</button>
       <label style="font-size:13px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px"><input type="checkbox" id="monAuto" checked> 30초 자동갱신</label>
     </div>
     <div id="monStatus" style="margin-bottom:12px;color:#666;font-size:13px"></div>
@@ -1702,6 +1713,13 @@ async function setMonMode(m) {
 async function runMonTick() {
   document.getElementById('monStatus').textContent = '검사 중...';
   try { await fetch('/api/monitor/tick?token=' + encodeURIComponent(TOKEN), { method: 'POST' }); } catch (e) {}
+  loadMonitor();
+}
+
+async function resetMonitor() {
+  if (!confirm('검사 기록(seen/로그)을 초기화합니다. 현재 답변대기 질문들이 다음 검사 때 다시 분류됩니다. 계속할까요?')) return;
+  try { await fetch('/api/monitor/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) }); } catch (e) {}
+  document.getElementById('monStatus').textContent = '초기화됨 — "지금 1회 검사"로 다시 분류하세요.';
   loadMonitor();
 }
 
