@@ -1,0 +1,34 @@
+name: monitor-keepalive
+
+# 학습무관 질문 자동 검열 감시기 트리거 + Render 콜드스타트 방지.
+# 5분마다 /api/monitor/tick 호출 → Render dyno를 깨워두고(절전 방지),
+# 깨어있는 동안 서버 인프로세스 60초 폴링이 실제 검사를 수행한다.
+# 수동 실행: Actions 탭 → monitor-keepalive → Run workflow.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: monitor-keepalive
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: trigger monitor tick
+        env:
+          SECRET: ${{ secrets.MONITOR_SECRET }}
+        run: |
+          code=$(curl -s -m 60 -o /tmp/out.json -w "%{http_code}" \
+            -X POST "https://qna-report.onrender.com/api/monitor/tick?secret=${SECRET}")
+          echo "HTTP $code"
+          cat /tmp/out.json || true
+          echo
+          # tick이 NEED_LOGIN/오류여도 keep-alive 목적은 달성 → 실패로 처리하지 않음
+          if [ "$code" != "200" ]; then echo "warning: non-200 (서버 기동 중일 수 있음)"; fi
