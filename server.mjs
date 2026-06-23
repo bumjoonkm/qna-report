@@ -90,8 +90,8 @@ const REJECT_REASON_CODE = 'QA250004';    // 기타사유 (ETC)
 const REJECT_REASON_TEXT = '부적절한 질문';
 const MONITOR_CONFIDENCE_THRESHOLD = 0.85; // 학습무관 거절 최소 신뢰도 (고정밀: 오거절 방지)
 const MONITOR_CLASSIFY_CONCURRENCY = 5;
-const MONITOR_SEEN_CAP = 3000;            // 중복처리 방지용 일련번호 보관 상한
-const MONITOR_LOG_CAP = 300;              // 검열 로그 보관 상한
+const MONITOR_SEEN_CAP = 20000;          // 하루치 답변대기 중복처리 방지
+const MONITOR_LOG_CAP = 1500;            // 검열 로그 보관 상한 (Upstash 값 크기 고려)
 const MONITOR_INTERVAL_MS = 60 * 1000;    // 인프로세스 폴링 주기 (외부 cron 보조)
 
 function lastDayOfMonth(year, month) {
@@ -1083,6 +1083,8 @@ async function runMonitorTick(trigger) {
     const seen = new Set((await diskGet('monitor:seen')) || []);
     const fresh = items.filter(it => !seen.has(it.qnaQuestionMasterSerialNo));
     const log = (await diskGet('monitor:log')) || [];
+    const stats = (await diskGet('monitor:stats')) || { since: Date.now(), processed: 0, flagged: 0, rejected: 0, byLabel: {} };
+    if (!stats.byLabel) stats.byLabel = {};
     await parallelMap(fresh, async (it) => {
       const serial = it.qnaQuestionMasterSerialNo;
       status.processed++;
@@ -1103,11 +1105,18 @@ async function runMonitorTick(trigger) {
           catch (e) { action = 'reject_failed'; err = e.message; }
         } else { action = 'would_reject'; }
       }
-      if (classified) seen.add(serial); // 분류 실패건은 seen에 안 넣어 다음 틱에 재시도
-      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 500), label, confidence, reason, mode, action, err, ts: Date.now() });
+      if (classified) {
+        seen.add(serial); // 분류 실패건은 seen에 안 넣어 다음 틱에 재시도
+        stats.processed = (stats.processed || 0) + 1;
+        stats.byLabel[label] = (stats.byLabel[label] || 0) + 1;
+        if (action === 'would_reject' || action === 'rejected' || action === 'reject_failed') stats.flagged = (stats.flagged || 0) + 1;
+        if (action === 'rejected') stats.rejected = (stats.rejected || 0) + 1;
+      }
+      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 300), label, confidence, reason, mode, action, err, ts: Date.now() });
     }, MONITOR_CLASSIFY_CONCURRENCY);
     diskSet('monitor:seen', Array.from(seen).slice(-MONITOR_SEEN_CAP));
     diskSet('monitor:log', log.slice(0, MONITOR_LOG_CAP));
+    diskSet('monitor:stats', stats);
     status.ok = true;
   } catch (e) {
     status.ok = false; status.error = e.message;
@@ -1305,6 +1314,7 @@ const server = createServer(async (req, res) => {
       log: (await diskGet('monitor:log')) || [],
       mode: (await diskGet('monitor:mode')) || 'shadow',
       status: (await diskGet('monitor:status')) || null,
+      stats: (await diskGet('monitor:stats')) || null,
       hasAuth: !!(auth && auth.accessToken),
       apiKey: !!ANTHROPIC_API_KEY,
       threshold: MONITOR_CONFIDENCE_THRESHOLD,
@@ -1327,6 +1337,7 @@ const server = createServer(async (req, res) => {
     if (!body.token) { json(res, 401, { error: 'token 필요' }); return; }
     diskSet('monitor:seen', []);
     diskSet('monitor:log', []);
+    diskSet('monitor:stats', { since: Date.now(), processed: 0, flagged: 0, rejected: 0, byLabel: {} });
     json(res, 200, { ok: true });
     return;
   }
@@ -1683,6 +1694,17 @@ function renderMonitor(d) {
       (st.ok === false ? (' · <span style="color:#c53030">오류: ' + esc(st.error || '') + (st.error === 'NEED_LOGIN' ? ' (재로그인 필요)' : '') + '</span>') : '');
   }
   document.getElementById('monStatus').innerHTML = warn + stx;
+  const cs = d.stats;
+  let sum = '';
+  if (cs) {
+    const bl = cs.byLabel || {};
+    const hrs = cs.since ? ((Date.now() - cs.since) / 3600000).toFixed(1) : '0';
+    sum = '<div class="cards" style="margin-bottom:16px">' +
+      '<div class="card"><div class="lb">누적 처리</div><div class="vl">' + (cs.processed || 0) + '건</div><div class="sm">시작 ' + (cs.since ? new Date(cs.since).toLocaleString('ko-KR') : '-') + ' (' + hrs + '시간)</div></div>' +
+      '<div class="card"><div class="lb">학습무관 검출</div><div class="vl hl">' + (cs.flagged || 0) + '건</div><div class="sm">' + (d.mode === 'auto' ? ('실제 거절 ' + (cs.rejected || 0)) : '그림자(거절 예정)') + '</div></div>' +
+      '<div class="card"><div class="lb">분류 분포</div><div class="vl" style="font-size:15px;line-height:1.6">정상 ' + (bl['정상질문'] || 0) + ' · 상담 ' + (bl['학습상담'] || 0) + ' · <span style="color:#c53030">무관 ' + (bl['학습무관'] || 0) + '</span></div></div>' +
+      '</div>';
+  }
   const rows = (d.log || []).map(function (l) {
     const color = l.label === '학습무관' ? '#c53030' : (l.label === '학습상담' ? '#2b6cb0' : '#718096');
     let act = '-';
@@ -1697,7 +1719,7 @@ function renderMonitor(d) {
       '</td><td>' + conf + '</td><td style="white-space:nowrap">' + act +
       (l.err ? '<div style="color:#c53030;font-size:11px">' + esc(l.err) + '</div>' : '') + '</td></tr>';
   }).join('');
-  document.getElementById('monResult').innerHTML =
+  document.getElementById('monResult').innerHTML = sum +
     '<table><thead><tr><th>시각</th><th>일련번호</th><th>TA ID</th><th>질문</th><th>판정</th><th>신뢰</th><th>처리</th></tr></thead><tbody>' +
     (rows || '<tr><td colspan="7" style="color:#888;padding:20px">아직 검열 기록이 없습니다.</td></tr>') + '</tbody></table>';
 }
