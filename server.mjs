@@ -1048,6 +1048,19 @@ async function rejectQuestion(token, serial) {
   return patch(`/v1/qna/${serial}/status/answer-no-admit`, token, payload);
 }
 
+// 질문 본문 추출. 실제 질문 텍스트는 questionContent에 들어있음.
+// (list 축약본 대비 상세의 questionContent를 우선. 폴백: questionDetails[].questionContsNm)
+function extractQuestionText(obj) {
+  if (!obj) return '';
+  if (typeof obj.questionContent === 'string' && obj.questionContent.trim()) return obj.questionContent.trim();
+  const qd = obj.questionDetails && obj.questionDetails[0];
+  if (qd) {
+    if (typeof qd.questionContent === 'string' && qd.questionContent.trim()) return qd.questionContent.trim();
+    if (typeof qd.questionContsNm === 'string' && qd.questionContsNm.trim()) return qd.questionContsNm.trim();
+  }
+  return '';
+}
+
 // 한 번의 폴링 틱: 답변대기(온라인) 신규 질문 분류 → 학습무관 거절/로그.
 async function runMonitorTick(trigger) {
   if (monitorRunning) return { skipped: 'running' };
@@ -1072,13 +1085,17 @@ async function runMonitorTick(trigger) {
     const log = (await diskGet('monitor:log')) || [];
     await parallelMap(fresh, async (it) => {
       const serial = it.qnaQuestionMasterSerialNo;
-      const text = ((it.questionDetails && it.questionDetails[0] && it.questionDetails[0].questionContsNm) || '').trim();
       status.processed++;
-      let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false;
+      let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false, text = '';
       try {
+        // 상세 조회해서 전체 questionContent 확보 (list 축약/누락 방지)
+        let detail = null;
+        try { const d = await get(`/v1/qna/${serial}`, token); detail = d && d.data; } catch (e) { err = '상세 조회 실패: ' + e.message; }
+        text = extractQuestionText(detail) || extractQuestionText(it);
+        if (err && !text) throw new Error(err); // 본문 못 얻으면 분류 실패로 → 재시도
         if (!text) { label = '정상질문'; reason = '빈 텍스트(이미지 질문) → 거절 안 함'; classified = true; }
         else { const c = await classifyQuestion(text); label = c.label; confidence = c.confidence; reason = c.reason; classified = true; }
-      } catch (e) { err = e.message; reason = '분류 오류'; }
+      } catch (e) { err = e.message; reason = '조회/분류 오류'; }
       if (classified && label === '학습무관' && confidence >= MONITOR_CONFIDENCE_THRESHOLD) {
         status.flagged++;
         if (mode === 'auto') {
