@@ -80,6 +80,20 @@ const BRANCHES = [
 const AI_TA_IDS = new Set(['aiowl']);
 const USD_TO_KRW = 1450;
 
+// ── 학습무관 질문 자동 검열 감시기 설정 ──
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const MONITOR_SECRET = process.env.MONITOR_SECRET || '';
+const MONITOR_MODEL = process.env.MONITOR_MODEL || 'claude-haiku-4-5';
+const MONITOR_STATUS_WAIT = 'QA120002';   // 답변대기
+const MONITOR_DIVISION = 'QA110002';      // 온라인 질문
+const REJECT_REASON_CODE = 'QA250004';    // 기타사유 (ETC)
+const REJECT_REASON_TEXT = '부적절한 질문';
+const MONITOR_CONFIDENCE_THRESHOLD = 0.85; // 학습무관 거절 최소 신뢰도 (고정밀: 오거절 방지)
+const MONITOR_CLASSIFY_CONCURRENCY = 5;
+const MONITOR_SEEN_CAP = 3000;            // 중복처리 방지용 일련번호 보관 상한
+const MONITOR_LOG_CAP = 300;              // 검열 로그 보관 상한
+const MONITOR_INTERVAL_MS = 60 * 1000;    // 인프로세스 폴링 주기 (외부 cron 보조)
+
 function lastDayOfMonth(year, month) {
   return new Date(year, month, 0).getDate();
 }
@@ -899,6 +913,194 @@ function json(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  학습무관 질문 자동 검열 감시기
+//  온라인 "답변대기" 질문을 폴링 → Claude로 분류 → 학습무관만 답변불가 처리.
+//  그림자 모드(기본): 실제 거절 없이 "거절했을 것"만 기록. 자동 모드: 실거절.
+// ════════════════════════════════════════════════════════════════════
+
+const MONITOR_SYS_PROMPT = [
+  '너는 학원 TA(조교) 질문게시판의 분류기다. 학생이 올린 질문 한 건의 텍스트를 읽고 아래 3가지 중 하나로 분류한다.',
+  '',
+  '판정은 반드시 다음 "순서"대로 적용한다:',
+  '',
+  '0) [최우선 override] 질문 어디에라도 학습과 무관한 콘텐츠 요청이 섞여 있으면 → "학습무관".',
+  '   예: 노래/곡/음악/OST/뮤직비디오/뮤비/신청곡/플레이리스트를 들려달라거나 올려달라, 불러달라, 성대모사,',
+  '   영상편지, 가수명+곡명 신청, "화면에 문제풀이만 띄우고 노래 들려주세요" 등.',
+  '   앞부분이 멀쩡한 문제 풀이 질문이어도, 이런 콘텐츠 요청이 섞이면 무조건 학습무관이다.',
+  '',
+  '1) "학습무관": 문제 풀이도, 학습 방법/방향 상담도 아닌 모든 글.',
+  '   - 작별/감사/응원 인사, TA에게 거는 사담·잡담, 수수께끼·시 낭송·MBTI·신변잡기,',
+  '     시설/분실물 잡담, 단순 감탄, 학습과 무관한 부탁 등.',
+  '',
+  '2) "학습상담": 특정 문제의 정답/풀이가 아니라, 일반적인 공부 방법·학습 방향·성적·멘탈 상담.',
+  '   - 예: "인문 지문은 어떻게 읽어야 하나요", "n제/컨텐츠 추천해주세요", "강사컨 vs 시중컨",',
+  '     점수 나열 후 "어떻게 공부해야 올릴까요", 슬럼프·불안·실수 잡는 법, 하반기 커리큘럼 등.',
+  '',
+  '3) "정상질문": 특정 문제·지문·선지에 대한 풀이/개념 질문, 특정 문제의 풀이 영상 요청, 이미지로 첨부한 문제 질문.',
+  '   - 예: "ㄷ을 어떻게 판단하나요", "f(e)를 어떻게 찾나요", "한랭전선인 이유가 뭔가요", "영상으로 풀이 부탁드려요".',
+  '',
+  '주의: "학습상담"과 "정상질문"은 절대 거절 대상이 아니므로, 확신이 없으면 "학습무관"으로 분류하지 마라(보수적으로).',
+  '',
+  '반드시 아래 JSON 한 줄만 출력한다(다른 말 금지):',
+  '{"label":"학습무관|학습상담|정상질문","confidence":0~1 사이 숫자,"reason":"짧은 근거"}',
+].join('\n');
+
+let monitorRunning = false;
+
+// PATCH 헬퍼 (거절 처리용). get()과 동일 인증 + Origin/Referer 헤더.
+async function patch(path, token, body, retries = 2) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(`${API}${path}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Origin': 'https://qna-admin.hiconsysvc.com',
+        'Referer': 'https://qna-admin.hiconsysvc.com/',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) { try { return await res.json(); } catch { return {}; } }
+    if (res.status >= 500 && i < retries - 1) { await new Promise(r => setTimeout(r, 800 * (i + 1))); continue; }
+    const t = await res.text().catch(() => '');
+    throw new Error(`PATCH ${res.status} ${t.slice(0, 200)}`);
+  }
+}
+
+function jwtPayload(token) {
+  try {
+    const seg = token.split('.')[1];
+    return JSON.parse(Buffer.from(seg, 'base64').toString('utf8'));
+  } catch { return {}; }
+}
+function jwtExpMs(token) { const p = jwtPayload(token); return (p.exp || 0) * 1000; }
+function jwtClaim(token, key) { return jwtPayload(token)[key]; }
+
+// verify(2FA) 응답에서 감시용 인증정보 추출 + 영속 저장
+function saveMonitorAuth(data) {
+  if (!data || !data.accessToken) return;
+  const auth = {
+    accessToken: data.accessToken,
+    refreshToken: data.refreshToken || null,
+    managerAccountSerialNo:
+      data.managerAccountSerialNo ?? data.managerSerialNo ??
+      jwtClaim(data.accessToken, 'managerAccountSerialNo') ??
+      jwtClaim(data.accessToken, 'sub') ?? null,
+    savedAt: Date.now(),
+  };
+  diskSet('monitor:auth', auth);
+}
+
+// 만료 임박 시 refresh로 2FA 없이 토큰 연장. 실패 시 'NEED_LOGIN'.
+async function ensureMonitorToken() {
+  const auth = await diskGet('monitor:auth');
+  if (!auth || !auth.accessToken) throw new Error('NEED_LOGIN');
+  if (jwtExpMs(auth.accessToken) - Date.now() > 5 * 60 * 1000) return auth.accessToken;
+  if (!auth.refreshToken || auth.managerAccountSerialNo == null) throw new Error('NEED_LOGIN');
+  const r = await post('/v1/manager/auth/refresh', {
+    managerAccountSerialNo: auth.managerAccountSerialNo,
+    refreshToken: auth.refreshToken,
+  });
+  const data = r && r.data;
+  if (!data || !data.accessToken || !data.refreshToken) throw new Error('NEED_LOGIN');
+  const next = { ...auth, accessToken: data.accessToken, refreshToken: data.refreshToken, savedAt: Date.now() };
+  diskSet('monitor:auth', next);
+  return next.accessToken;
+}
+
+// Claude 분류. {label, confidence, reason} 반환.
+async function classifyQuestion(text) {
+  if (!ANTHROPIC_API_KEY) throw new Error('NO_API_KEY');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MONITOR_MODEL,
+      max_tokens: 200,
+      system: MONITOR_SYS_PROMPT,
+      messages: [{ role: 'user', content: text }],
+    }),
+  });
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`anthropic ${res.status} ${t.slice(0, 150)}`); }
+  const body = await res.json();
+  const out = (body.content || []).map(b => b.text || '').join('');
+  const m = out.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error('파싱 실패');
+  const j = JSON.parse(m[0]);
+  return { label: j.label, confidence: Number(j.confidence) || 0, reason: j.reason || '' };
+}
+
+// 답변불가(거절) 처리. SPA와 동일하게 PATCH .../status/answer-no-admit.
+// "최대한 다시질문 가능" → reQuestionableYn:'Y'. (재질문 플래그 정확한 키는 실제 캡처로 확정 권장)
+async function rejectQuestion(token, serial) {
+  const payload = {
+    qnaQuestionMasterSerialNo: serial,
+    answerNoAdmittedReasonCommonCode: REJECT_REASON_CODE,
+    answerNoAdmittedReasonDescription: REJECT_REASON_TEXT,
+    reQuestionableYn: 'Y',
+  };
+  return patch(`/v1/qna/${serial}/status/answer-no-admit`, token, payload);
+}
+
+// 한 번의 폴링 틱: 답변대기(온라인) 신규 질문 분류 → 학습무관 거절/로그.
+async function runMonitorTick(trigger) {
+  if (monitorRunning) return { skipped: 'running' };
+  monitorRunning = true;
+  const status = { lastTickAt: Date.now(), trigger, processed: 0, flagged: 0, rejected: 0, ok: false };
+  try {
+    const token = await ensureMonitorToken();
+    const mode = (await diskGet('monitor:mode')) || 'shadow';
+    const end = todayLocalDt();
+    const start = daysToDt(dtToDays(end) - 1); // 어제~오늘 (밤사이 등록분 포함)
+    const qs = `startDt=${start}&endDt=${end}&questionStatusCommonCode=${MONITOR_STATUS_WAIT}&questionDivisionCommonCode=${MONITOR_DIVISION}&searchType=taName`;
+    const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&${qs}`, token);
+    const total = (first.data && first.data.totalCount) || 0;
+    const pages = Math.ceil(total / PAGE_SIZE) || 1;
+    const items = [...((first.data && first.data.contents) || [])];
+    for (let p = 2; p <= pages; p++) {
+      const b = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&${qs}`, token);
+      items.push(...((b.data && b.data.contents) || []));
+    }
+    const seen = new Set((await diskGet('monitor:seen')) || []);
+    const fresh = items.filter(it => !seen.has(it.qnaQuestionMasterSerialNo));
+    const log = (await diskGet('monitor:log')) || [];
+    await parallelMap(fresh, async (it) => {
+      const serial = it.qnaQuestionMasterSerialNo;
+      const text = ((it.questionDetails && it.questionDetails[0] && it.questionDetails[0].questionContsNm) || '').trim();
+      status.processed++;
+      let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false;
+      try {
+        if (!text) { label = '정상질문'; reason = '빈 텍스트(이미지 질문) → 거절 안 함'; classified = true; }
+        else { const c = await classifyQuestion(text); label = c.label; confidence = c.confidence; reason = c.reason; classified = true; }
+      } catch (e) { err = e.message; reason = '분류 오류'; }
+      if (classified && label === '학습무관' && confidence >= MONITOR_CONFIDENCE_THRESHOLD) {
+        status.flagged++;
+        if (mode === 'auto') {
+          try { await rejectQuestion(token, serial); action = 'rejected'; status.rejected++; }
+          catch (e) { action = 'reject_failed'; err = e.message; }
+        } else { action = 'would_reject'; }
+      }
+      if (classified) seen.add(serial); // 분류 실패건은 seen에 안 넣어 다음 틱에 재시도
+      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 500), label, confidence, reason, mode, action, err, ts: Date.now() });
+    }, MONITOR_CLASSIFY_CONCURRENCY);
+    diskSet('monitor:seen', Array.from(seen).slice(-MONITOR_SEEN_CAP));
+    diskSet('monitor:log', log.slice(0, MONITOR_LOG_CAP));
+    status.ok = true;
+  } catch (e) {
+    status.ok = false; status.error = e.message;
+  } finally {
+    monitorRunning = false;
+    diskSet('monitor:status', status);
+  }
+  return status;
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -937,6 +1139,7 @@ const server = createServer(async (req, res) => {
     const { accountId, accountPassword, certNo } = JSON.parse(await readBody(req));
     const result = await post('/v1/manager/auth/token', { accountId, accountPassword, certNo });
     if (result.code === 'R20000' && result.data) {
+      saveMonitorAuth(result.data); // 감시기용 토큰(refresh 포함) 영속 저장
       json(res, 200, { ok: true, accessToken: result.data.accessToken });
     } else {
       json(res, 200, { ok: false, message: result.message });
@@ -1061,6 +1264,43 @@ const server = createServer(async (req, res) => {
     } catch (e) {
       json(res, 500, { error: e.message });
     }
+    return;
+  }
+
+  // ── 학습무관 자동 검열 감시기 ──
+  // 폴링 트리거: 외부 cron(secret) 또는 로그인된 UI(token)에서 호출
+  if (req.method === 'POST' && url.pathname === '/api/monitor/tick') {
+    const secret = url.searchParams.get('secret');
+    const token = url.searchParams.get('token');
+    const okSecret = MONITOR_SECRET && secret === MONITOR_SECRET;
+    if (!okSecret && !token) { json(res, 403, { error: 'secret 또는 token 필요' }); return; }
+    try { json(res, 200, await runMonitorTick(okSecret ? 'cron' : 'manual')); }
+    catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/monitor/log') {
+    const token = url.searchParams.get('token');
+    const okSecret = MONITOR_SECRET && url.searchParams.get('secret') === MONITOR_SECRET;
+    if (!token && !okSecret) { json(res, 401, { error: 'token 필요' }); return; }
+    const auth = await diskGet('monitor:auth');
+    json(res, 200, {
+      log: (await diskGet('monitor:log')) || [],
+      mode: (await diskGet('monitor:mode')) || 'shadow',
+      status: (await diskGet('monitor:status')) || null,
+      hasAuth: !!(auth && auth.accessToken),
+      apiKey: !!ANTHROPIC_API_KEY,
+      threshold: MONITOR_CONFIDENCE_THRESHOLD,
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/monitor/mode') {
+    const body = JSON.parse(await readBody(req));
+    if (!body.token) { json(res, 401, { error: 'token 필요' }); return; }
+    const mode = body.mode === 'auto' ? 'auto' : 'shadow';
+    diskSet('monitor:mode', mode);
+    json(res, 200, { ok: true, mode });
     return;
   }
 
@@ -1201,6 +1441,7 @@ const HTML = `<!DOCTYPE html>
     <div class="tab" onclick="switchTab('rating')">별점 비교</div>
     <div class="tab" onclick="switchTab('voucher')">바우처 내역 확인</div>
     <div class="tab" onclick="switchTab('vidreuse')">동영상 재활용</div>
+    <div class="tab" onclick="switchTab('monitor')">질문 검열 감시</div>
   </div>
 
   <!-- 답변불가 리포트 -->
@@ -1292,6 +1533,21 @@ const HTML = `<!DOCTYPE html>
     </div>
     <div id="vrResult"></div>
   </div>
+
+  <!-- 질문 검열 감시 -->
+  <div class="page" id="page-monitor">
+    <div class="ctrl">
+      <span style="font-size:13px;color:#666">현재 모드:</span>
+      <span id="monMode" style="font-weight:700">-</span>
+      <button class="btn" onclick="setMonMode('shadow')">그림자 모드</button>
+      <button class="btn" style="background:#c53030" onclick="setMonMode('auto')">자동 거절 켜기</button>
+      <button class="btn ex" onclick="loadMonitor()">새로고침</button>
+      <button class="btn" onclick="runMonTick()">지금 1회 검사</button>
+      <label style="font-size:13px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px"><input type="checkbox" id="monAuto" checked> 30초 자동갱신</label>
+    </div>
+    <div id="monStatus" style="margin-bottom:12px;color:#666;font-size:13px"></div>
+    <div id="monResult"></div>
+  </div>
 </div>
 
 <script>
@@ -1368,7 +1624,75 @@ function switchTab(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelector('.tab[onclick*="' + name + '"]').classList.add('active');
   document.getElementById('page-' + name).classList.add('active');
+  if (name === 'monitor') loadMonitor();
 }
+
+// ── 질문 검열 감시 ──
+
+async function loadMonitor() {
+  if (!TOKEN) return;
+  try {
+    const res = await fetch('/api/monitor/log?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) throw new Error(await res.text());
+    renderMonitor(await res.json());
+  } catch (e) {
+    document.getElementById('monResult').innerHTML = '<div style="color:#e53e3e;padding:20px">오류: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderMonitor(d) {
+  const ml = document.getElementById('monMode');
+  ml.textContent = d.mode === 'auto' ? '자동 거절 ON (실제 거절함)' : '그림자 (거절 안 함, 기록만)';
+  ml.style.color = d.mode === 'auto' ? '#c53030' : '#2b6cb0';
+  let warn = '';
+  if (!d.hasAuth) warn += '<div style="color:#c53030">⚠ 감시용 인증 없음 — 이 사이트에서 로그인하면 자동 저장됩니다.</div>';
+  if (!d.apiKey) warn += '<div style="color:#c53030">⚠ ANTHROPIC_API_KEY 미설정 — 분류 불가. Render 환경변수에 추가하세요.</div>';
+  const st = d.status;
+  let stx = '';
+  if (st) {
+    stx = '마지막 검사: ' + new Date(st.lastTickAt).toLocaleString('ko-KR') +
+      ' · 처리 ' + (st.processed || 0) + ' · 학습무관 검출 ' + (st.flagged || 0) + ' · 거절 ' + (st.rejected || 0) +
+      (st.ok === false ? (' · <span style="color:#c53030">오류: ' + esc(st.error || '') + (st.error === 'NEED_LOGIN' ? ' (재로그인 필요)' : '') + '</span>') : '');
+  }
+  document.getElementById('monStatus').innerHTML = warn + stx;
+  const rows = (d.log || []).map(function (l) {
+    const color = l.label === '학습무관' ? '#c53030' : (l.label === '학습상담' ? '#2b6cb0' : '#718096');
+    let act = '-';
+    if (l.action === 'rejected') act = '<span style="color:#c53030;font-weight:700">거절됨</span>';
+    else if (l.action === 'would_reject') act = '<span style="color:#dd6b20;font-weight:600">거절 예정(그림자)</span>';
+    else if (l.action === 'reject_failed') act = '<span style="color:#c53030">거절 실패</span>';
+    const conf = (l.confidence != null && l.confidence > 0) ? (l.confidence * 100).toFixed(0) + '%' : '';
+    return '<tr><td style="white-space:nowrap">' + new Date(l.ts).toLocaleTimeString('ko-KR') +
+      '</td><td>' + l.serial + '</td><td>' + esc(l.taId || '') +
+      '</td><td style="max-width:460px">' + esc(l.text || '') +
+      '</td><td style="color:' + color + ';font-weight:600;white-space:nowrap">' + esc(l.label || '') +
+      '</td><td>' + conf + '</td><td style="white-space:nowrap">' + act +
+      (l.err ? '<div style="color:#c53030;font-size:11px">' + esc(l.err) + '</div>' : '') + '</td></tr>';
+  }).join('');
+  document.getElementById('monResult').innerHTML =
+    '<table><thead><tr><th>시각</th><th>일련번호</th><th>TA ID</th><th>질문</th><th>판정</th><th>신뢰</th><th>처리</th></tr></thead><tbody>' +
+    (rows || '<tr><td colspan="7" style="color:#888;padding:20px">아직 검열 기록이 없습니다.</td></tr>') + '</tbody></table>';
+}
+
+async function setMonMode(m) {
+  if (m === 'auto' && !confirm('자동 거절을 켭니다. 학습무관으로 분류된 답변대기 질문이 실제로 답변불가 처리됩니다. 계속할까요?')) return;
+  try {
+    await fetch('/api/monitor/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN, mode: m }) });
+  } catch (e) {}
+  loadMonitor();
+}
+
+async function runMonTick() {
+  document.getElementById('monStatus').textContent = '검사 중...';
+  try { await fetch('/api/monitor/tick?token=' + encodeURIComponent(TOKEN), { method: 'POST' }); } catch (e) {}
+  loadMonitor();
+}
+
+setInterval(function () {
+  const p = document.getElementById('page-monitor');
+  const c = document.getElementById('monAuto');
+  if (p && p.classList.contains('active') && c && c.checked && TOKEN) loadMonitor();
+}, 30000);
 
 // ── 답변불가 리포트 ──
 
@@ -2163,3 +2487,7 @@ document.getElementById('code').addEventListener('keydown', e => { if (e.key ===
 </html>`;
 
 server.listen(PORT, () => console.log(`http://localhost:${PORT}`));
+
+// 감시기 인프로세스 폴링 (dyno 깨어있을 때 보조 구동). 외부 cron이 keep-alive + 주 트리거.
+// 인증 없으면(NEED_LOGIN) 조용히 패스.
+setInterval(() => { runMonitorTick('interval').catch(() => {}); }, MONITOR_INTERVAL_MS);
