@@ -90,6 +90,7 @@ const REJECT_REASON_CODE = 'QA250004';    // 기타사유 (ETC)
 const REJECT_REASON_TEXT = '부적절한 질문';
 const MONITOR_CONFIDENCE_THRESHOLD = 0.85; // 학습무관 거절 최소 신뢰도 (고정밀: 오거절 방지)
 const MONITOR_CLASSIFY_CONCURRENCY = 5;
+const MONITOR_IMG_GUARD_MAXLEN = 12;     // 이미지 첨부 + 본문 이 길이 이하면 LLM 없이 정상질문 (이미지 속 문제 질문)
 const MONITOR_SEEN_CAP = 20000;          // 하루치 답변대기 중복처리 방지
 const MONITOR_LOG_CAP = 1500;            // 검열 로그 보관 상한 (Upstash 값 크기 고려)
 const MONITOR_INTERVAL_MS = 60 * 1000;    // 인프로세스 폴링 주기 (외부 cron 보조)
@@ -920,27 +921,37 @@ function json(res, status, data) {
 // ════════════════════════════════════════════════════════════════════
 
 const MONITOR_SYS_PROMPT = [
-  '너는 학원 TA(조교) 질문게시판의 분류기다. 학생이 올린 질문 한 건의 텍스트를 읽고 아래 3가지 중 하나로 분류한다.',
+  '너는 학원 TA(조교) 온라인 질문게시판의 분류기다. 학생 질문 한 건을 읽고 아래 3가지 중 하나로 분류한다.',
   '',
-  '판정은 반드시 다음 "순서"대로 적용한다:',
+  '입력 형식(user 메시지)은 두 줄이다:',
+  '  첨부 이미지: <장수 또는 "없음">',
+  '  질문 본문: <학생이 입력한 텍스트>',
+  '학생은 보통 문제를 사진으로 첨부하고 본문에는 짧은 설명·콘텐츠명·인사만 적는다. 첨부 이미지가 있으면 본문이 빈약해도 이미지 속 문제에 대한 질문이다.',
   '',
-  '0) [최우선 override] 질문 어디에라도 학습과 무관한 콘텐츠 요청이 섞여 있으면 → "학습무관".',
-  '   예: 노래/곡/음악/OST/뮤직비디오/뮤비/신청곡/플레이리스트를 들려달라거나 올려달라, 불러달라, 성대모사,',
-  '   영상편지, 가수명+곡명 신청, "화면에 문제풀이만 띄우고 노래 들려주세요" 등.',
-  '   앞부분이 멀쩡한 문제 풀이 질문이어도, 이런 콘텐츠 요청이 섞이면 무조건 학습무관이다.',
+  '◆ 가장 중요한 대원칙 ◆',
+  '"학습무관"은 본문에 "학습과 무관한 내용이 실제로 들어 있을 때"만 붙인다.',
+  '본문이 짧거나, 빈약하거나, 출처·콘텐츠명·숫자만 있거나, 의미가 불명확한 것은 "학습무관"이 아니다 → "정상질문"이다.',
+  '즉 "학습 내용이 없다"는 이유로 거절하면 안 된다. "학습과 무관한 내용이 있다"가 거절의 유일한 근거다. 애매하면 정상질문이다.',
   '',
-  '1) "학습무관": 문제 풀이도, 학습 방법/방향 상담도 아닌 모든 글.',
-  '   - 작별/감사/응원 인사, TA에게 거는 사담·잡담, 수수께끼·시 낭송·MBTI·신변잡기,',
-  '     시설/분실물 잡담, 단순 감탄, 학습과 무관한 부탁 등.',
+  '판정 순서:',
   '',
-  '2) "학습상담": 특정 문제의 정답/풀이가 아니라, 일반적인 공부 방법·학습 방향·성적·멘탈 상담.',
-  '   - 예: "인문 지문은 어떻게 읽어야 하나요", "n제/컨텐츠 추천해주세요", "강사컨 vs 시중컨",',
-  '     점수 나열 후 "어떻게 공부해야 올릴까요", 슬럼프·불안·실수 잡는 법, 하반기 커리큘럼 등.',
+  '1) "학습무관" (거절 대상) — 본문에 학습과 무관한 내용이 실제로 들어 있는 경우. 문제 질문이 앞에 있어도 아래가 섞이면 학습무관이다(override):',
+  '   - TA/조교 신변·사담: "대면 티에이 이제 안 와요?", "방학 때 부엉이(자습실)에 얼마나 계셨어요?", 운동/건강/일정 잡담.',
+  '   - 외부 콘텐츠/잡지식 요청: 노래·곡·OST·뮤비 틀어/불러달라, 드라마·소설 줄거리나 등장 소재 소개, 성대모사, 영상편지.',
+  '   - 생활 잡담: 맛집/점심 추천, 연애 상담, 프로필사진·신변 독백, 학습과 무관한 단순 잡담.',
   '',
-  '3) "정상질문": 특정 문제·지문·선지에 대한 풀이/개념 질문, 특정 문제의 풀이 영상 요청, 이미지로 첨부한 문제 질문.',
-  '   - 예: "ㄷ을 어떻게 판단하나요", "f(e)를 어떻게 찾나요", "한랭전선인 이유가 뭔가요", "영상으로 풀이 부탁드려요".',
+  '2) "학습상담" (거절 안 함) — 특정 문제 풀이가 아니라 공부·진학에 대한 상담/안내:',
+  '   - 공부법·학습 방향·성적·멘탈, n제/컨텐츠 추천, 강사컨 비교, 커리큘럼.',
+  '   - 입시 문의: 지원 가능 대학, 입결·백분위·가산점 비교, 정시/수시 전략.',
+  '   - 콘텐츠·자료·강의의 위치/접근 방법, 자료 정리 요청.',
   '',
-  '주의: "학습상담"과 "정상질문"은 절대 거절 대상이 아니므로, 확신이 없으면 "학습무관"으로 분류하지 마라(보수적으로).',
+  '3) "정상질문" (거절 안 함) — 위 1·2가 아닌 나머지 전부. 특히 다음은 무조건 정상질문이다:',
+  '   - 특정 문제·지문·선지 풀이/개념 질문, 풀이 영상 요청, 작품의 표현법·개념 판단(예: "이 구절 독백체야 대화체야").',
+  '   - 첨부 이미지가 1장 이상이면 본문이 짧거나 비어 있어도 정상질문.',
+  '   - 콘텐츠/교재/회차/과목명만 적은 것: "브릿지", "서바이벌N", "시대기출", "교육청", "수2", "n제".',
+  '   - 6자리/8자리 숫자 = 기출 출처 표기다(예: "241103" = 24학년도 수능 3번; 수능은 11월). 정상질문.',
+  '   - 본문 밖(이미지)에 질문이 있음을 암시: "문제에 질문 같이 썼어요", "질문 적어뒀습니다", "사진에 적었어요".',
+  '   - 인사·막연한 요청·짧은 단편 입력: "안녕하세요 풀이 부탁드립니다", "어떻게 해야 해?", "자세하게 설명해주세요", "도와주세요", "답이 뭐예요", "." 나 "d" 같은 한두 글자.',
   '',
   '반드시 아래 JSON 한 줄만 출력한다(다른 말 금지):',
   '{"label":"학습무관|학습상담|정상질문","confidence":0~1 사이 숫자,"reason":"짧은 근거"}',
@@ -1011,8 +1022,9 @@ async function ensureMonitorToken() {
 }
 
 // Claude 분류. {label, confidence, reason} 반환.
-async function classifyQuestion(text) {
+async function classifyQuestion(text, imageCount = 0) {
   if (!ANTHROPIC_API_KEY) throw new Error('NO_API_KEY');
+  const userContent = `첨부 이미지: ${imageCount > 0 ? imageCount + '장' : '없음'}\n질문 본문: ${text}`;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -1024,7 +1036,7 @@ async function classifyQuestion(text) {
       model: MONITOR_MODEL,
       max_tokens: 200,
       system: MONITOR_SYS_PROMPT,
-      messages: [{ role: 'user', content: text }],
+      messages: [{ role: 'user', content: userContent }],
     }),
   });
   if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`anthropic ${res.status} ${t.slice(0, 150)}`); }
@@ -1034,6 +1046,19 @@ async function classifyQuestion(text) {
   if (!m) throw new Error('파싱 실패');
   const j = JSON.parse(m[0]);
   return { label: j.label, confidence: Number(j.confidence) || 0, reason: j.reason || '' };
+}
+
+// 분류 1건: 이미지 가드 후 LLM. tick·백테스트 공용.
+// 빈 본문 또는 (이미지 첨부 + 아주 짧은 본문)은 이미지 속 문제 질문이므로 LLM 없이 정상질문.
+async function classifyOne(text, imageCount) {
+  if (!text) {
+    return { label: '정상질문', confidence: 1, reason: imageCount > 0 ? `이미지 ${imageCount}장 첨부(본문 없음)` : '빈 텍스트', viaLLM: false };
+  }
+  if (imageCount > 0 && text.length <= MONITOR_IMG_GUARD_MAXLEN) {
+    return { label: '정상질문', confidence: 1, reason: `이미지 ${imageCount}장 + 짧은 본문(${text.length}자) → 이미지 질문`, viaLLM: false };
+  }
+  const c = await classifyQuestion(text, imageCount);
+  return { ...c, viaLLM: true };
 }
 
 // 답변불가(거절) 처리. SPA와 동일하게 PATCH .../status/answer-no-admit.
@@ -1088,15 +1113,16 @@ async function runMonitorTick(trigger) {
     await parallelMap(fresh, async (it) => {
       const serial = it.qnaQuestionMasterSerialNo;
       status.processed++;
-      let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false, text = '';
+      let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false, text = '', imageCount = 0;
       try {
-        // 상세 조회해서 전체 questionContent 확보 (list 축약/누락 방지)
+        // 상세 조회해서 전체 questionContent + 첨부 이미지 수 확보 (list 축약/누락 방지)
         let detail = null;
         try { const d = await get(`/v1/qna/${serial}`, token); detail = d && d.data; } catch (e) { err = '상세 조회 실패: ' + e.message; }
         text = extractQuestionText(detail) || extractQuestionText(it);
-        if (err && !text) throw new Error(err); // 본문 못 얻으면 분류 실패로 → 재시도
-        if (!text) { label = '정상질문'; reason = '빈 텍스트(이미지 질문) → 거절 안 함'; classified = true; }
-        else { const c = await classifyQuestion(text); label = c.label; confidence = c.confidence; reason = c.reason; classified = true; }
+        imageCount = (detail && Array.isArray(detail.questionFiles)) ? detail.questionFiles.length : 0;
+        if (err && !text && !imageCount) throw new Error(err); // 본문·첨부 둘 다 못 얻으면 분류 실패로 → 재시도
+        const c = await classifyOne(text, imageCount);
+        label = c.label; confidence = c.confidence; reason = c.reason; classified = true;
       } catch (e) { err = e.message; reason = '조회/분류 오류'; }
       if (classified && label === '학습무관' && confidence >= MONITOR_CONFIDENCE_THRESHOLD) {
         status.flagged++;
@@ -1112,7 +1138,7 @@ async function runMonitorTick(trigger) {
         if (action === 'would_reject' || action === 'rejected' || action === 'reject_failed') stats.flagged = (stats.flagged || 0) + 1;
         if (action === 'rejected') stats.rejected = (stats.rejected || 0) + 1;
       }
-      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 300), label, confidence, reason, mode, action, err, ts: Date.now() });
+      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 300), imageCount, label, confidence, reason, mode, action, err, ts: Date.now() });
     }, MONITOR_CLASSIFY_CONCURRENCY);
     diskSet('monitor:seen', Array.from(seen).slice(-MONITOR_SEEN_CAP));
     diskSet('monitor:log', log.slice(0, MONITOR_LOG_CAP));
@@ -1339,6 +1365,42 @@ const server = createServer(async (req, res) => {
     diskSet('monitor:log', []);
     diskSet('monitor:stats', { since: Date.now(), processed: 0, flagged: 0, rejected: 0, byLabel: {} });
     json(res, 200, { ok: true });
+    return;
+  }
+
+  // 골든셋 회귀 백테스트: [{serial, gold_label}] 받아 서버 토큰으로 detail 재조회(questionFiles 실측)
+  // → 현행 분류 로직 적용 → 오거절률 산출. 프롬프트 수정 시 회귀 검증용. secret gate.
+  if (req.method === 'POST' && url.pathname === '/api/monitor/backtest') {
+    const okSecret = MONITOR_SECRET && url.searchParams.get('secret') === MONITOR_SECRET;
+    if (!okSecret) { json(res, 403, { error: 'secret 필요' }); return; }
+    let cases;
+    try { cases = JSON.parse(await readBody(req)); } catch { json(res, 400, { error: 'JSON 배열 필요' }); return; }
+    if (!Array.isArray(cases) || !cases.length) { json(res, 400, { error: '[{serial, gold_label}] 배열 필요' }); return; }
+    try {
+      const token = await ensureMonitorToken();
+      const results = await parallelMap(cases, async (cs) => {
+        let detail = null, text = cs.text || '', imageCount = 0;
+        try { const d = await get(`/v1/qna/${cs.serial}`, token); detail = d && d.data; } catch {}
+        if (detail) { text = extractQuestionText(detail) || text; imageCount = Array.isArray(detail.questionFiles) ? detail.questionFiles.length : 0; }
+        const c = await classifyOne(text, imageCount);
+        const wouldReject = c.label === '학습무관' && c.confidence >= MONITOR_CONFIDENCE_THRESHOLD;
+        return { serial: cs.serial, gold: cs.gold_label || null, predicted: c.label, conf: c.confidence, imageCount, textLen: text.length, viaLLM: c.viaLLM, wouldReject };
+      }, MONITOR_CLASSIFY_CONCURRENCY);
+      const withGold = results.filter(r => r.gold);
+      const correctReject = withGold.filter(r => r.wouldReject && r.gold === '학습무관');
+      const overReject = withGold.filter(r => r.wouldReject && r.gold !== '학습무관');
+      const missed = withGold.filter(r => !r.wouldReject && r.gold === '학습무관');
+      const denom = correctReject.length + overReject.length;
+      json(res, 200, {
+        n: results.length, graded: withGold.length,
+        wouldRejectTotal: results.filter(r => r.wouldReject).length,
+        correctReject: correctReject.length, overReject: overReject.length, missed: missed.length,
+        precision: denom ? +(correctReject.length / denom).toFixed(3) : null,
+        overRejectCases: overReject.map(r => ({ serial: r.serial, gold: r.gold, conf: r.conf, imageCount: r.imageCount, textLen: r.textLen })),
+        missedCases: missed.map(r => ({ serial: r.serial, conf: r.conf, imageCount: r.imageCount })),
+        results,
+      });
+    } catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
 
