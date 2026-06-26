@@ -125,6 +125,14 @@ function todayLocalDt() {
   return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
 }
 
+// KST(UTC+9) 기준 '오늘' 날짜. Render는 UTC로 동작하므로 서버 로컬시각으로 '오늘'을
+// 계산하면 KST 00:00~09:00 사이 등록분이 하루 늦은 날짜창에서 누락된다. getTime()은
+// 절대시각(TZ 무관)이라 +9h 후 getUTC*로 읽으면 서버 TZ와 무관하게 항상 KST 벽시계.
+function kstTodayDt() {
+  const k = new Date(Date.now() + 9 * 3600 * 1000);
+  return k.getUTCFullYear() + '-' + String(k.getUTCMonth() + 1).padStart(2, '0') + '-' + String(k.getUTCDate()).padStart(2, '0');
+}
+
 // startDt부터 X일씩 자르기. 마지막 미완성 구간(< X일)은 버림.
 function splitPeriodByDays(startDt, endDt, daysPerBucket) {
   const startDays = dtToDays(startDt);
@@ -1113,7 +1121,7 @@ async function runMonitorTick(trigger) {
   try {
     const token = await ensureMonitorToken();
     const mode = (await diskGet('monitor:mode')) || 'shadow';
-    const end = todayLocalDt();
+    const end = kstTodayDt(); // KST 기준 오늘 (서버 UTC라 todayLocalDt면 자정 직후 누락)
     const start = daysToDt(dtToDays(end) - 1); // 어제~오늘 (밤사이 등록분 포함)
     const qs = `startDt=${start}&endDt=${end}&questionStatusCommonCode=${MONITOR_STATUS_WAIT}&questionDivisionCommonCode=${MONITOR_DIVISION}&searchType=taName`;
     const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&${qs}`, token);
