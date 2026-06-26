@@ -40,13 +40,13 @@ async function upstashGet(key) {
   } catch { return null; }
 }
 function upstashSet(key, data) {
-  if (!UPSTASH_ENABLED) return;
-  // fire-and-forget — 응답 지연 방지
-  fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
+  if (!UPSTASH_ENABLED) return Promise.resolve(false);
+  // 기본은 fire-and-forget(응답 지연 방지)이되, 호출부가 await하면 영속 보장 가능.
+  return fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'text/plain' },
     body: JSON.stringify(data),
-  }).catch(() => {});
+  }).then(r => r.ok).catch(() => false);
 }
 
 async function diskGet(key) {
@@ -66,6 +66,17 @@ async function diskGet(key) {
 function diskSet(key, data) {
   try { writeFileSync(`${CACHE_DIR}/${key}.json`, JSON.stringify(data)); } catch {}
   upstashSet(key, data);
+}
+// 영속이 반드시 필요한 값(1회용 회전 refreshToken 등)용: Upstash 기록을 await.
+// Render 무료 dyno는 재배포·절전 기동마다 로컬 파일이 사라지므로, 새 dyno가
+// 낡은(=폐기된) refreshToken을 읽지 않도록 새 토큰을 Upstash에 확정 저장한 뒤 진행한다.
+async function diskSetDurable(key, data) {
+  try { writeFileSync(`${CACHE_DIR}/${key}.json`, JSON.stringify(data)); } catch {}
+  if (!UPSTASH_ENABLED) return true;
+  for (let i = 0; i < 3; i++) {
+    if (await upstashSet(key, data)) return true;
+  }
+  return false;
 }
 
 const BRANCHES = [
@@ -994,8 +1005,8 @@ function jwtPayload(token) {
 function jwtExpMs(token) { const p = jwtPayload(token); return (p.exp || 0) * 1000; }
 function jwtClaim(token, key) { return jwtPayload(token)[key]; }
 
-// verify(2FA) 응답에서 감시용 인증정보 추출 + 영속 저장
-function saveMonitorAuth(data) {
+// verify(2FA) 응답에서 감시용 인증정보 추출 + 영속 저장 (Upstash 기록 await)
+async function saveMonitorAuth(data) {
   if (!data || !data.accessToken) return;
   const auth = {
     accessToken: data.accessToken,
@@ -1006,7 +1017,7 @@ function saveMonitorAuth(data) {
       jwtClaim(data.accessToken, 'sub') ?? null,
     savedAt: Date.now(),
   };
-  diskSet('monitor:auth', auth);
+  await diskSetDurable('monitor:auth', auth);
 }
 
 // 만료 임박 시 refresh로 2FA 없이 토큰 연장. 실패 시 'NEED_LOGIN'.
@@ -1021,8 +1032,11 @@ async function ensureMonitorToken() {
   });
   const data = r && r.data;
   if (!data || !data.accessToken || !data.refreshToken) throw new Error('NEED_LOGIN');
+  // 회전형 1회용 토큰: refresh 성공 순간 옛 refreshToken은 폐기됨. 새 토큰을
+  // Upstash에 확정 저장한 뒤 사용해야 dyno 교체 시 죽은 토큰을 물려받지 않는다.
   const next = { ...auth, accessToken: data.accessToken, refreshToken: data.refreshToken, savedAt: Date.now() };
-  diskSet('monitor:auth', next);
+  const persisted = await diskSetDurable('monitor:auth', next);
+  if (!persisted) console.warn('[monitor] refreshToken Upstash 영속 저장 실패 — 재배포/절전 시 재로그인 필요할 수 있음');
   return next.accessToken;
 }
 
@@ -1196,7 +1210,7 @@ const server = createServer(async (req, res) => {
     const { accountId, accountPassword, certNo } = JSON.parse(await readBody(req));
     const result = await post('/v1/manager/auth/token', { accountId, accountPassword, certNo });
     if (result.code === 'R20000' && result.data) {
-      saveMonitorAuth(result.data); // 감시기용 토큰(refresh 포함) 영속 저장
+      await saveMonitorAuth(result.data); // 감시기용 토큰(refresh 포함) 영속 저장
       json(res, 200, { ok: true, accessToken: result.data.accessToken });
     } else {
       json(res, 200, { ok: false, message: result.message });
