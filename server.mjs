@@ -50,6 +50,21 @@ function upstashSet(key, data) {
     body: JSON.stringify(data),
   }).then(r => r.ok).catch(() => false);
 }
+// 임의 Redis 명령 (Upstash REST: 명령 배열을 base URL에 POST). HSET/HVALS/EXPIRE 등.
+// 반환은 {result}의 result. 미설정/실패 시 null.
+async function upstashCmd(...args) {
+  if (!UPSTASH_ENABLED) return null;
+  try {
+    const res = await fetch(UPSTASH_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(args.map(String)),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body == null ? null : body.result;
+  } catch { return null; }
+}
 
 async function diskGet(key) {
   // 1) 로컬 hit
@@ -103,7 +118,7 @@ const REJECT_REASON_CODE = 'QA250004';    // 기타사유 (ETC) — 거절 처�
 const REJECT_REASON_TEXT = '부적절한 질문';
 const MONITOR_CLASSIFY_CONCURRENCY = 5;
 const MONITOR_SEEN_CAP = 20000;          // 하루치 답변대기 중복처리 방지
-const MONITOR_LOG_CAP = 1500;            // 검열 로그 보관 상한 (Upstash 값 크기 고려)
+const MONITOR_LOG_CAP = 500;             // UI 최근 로그 상한 (durable 저장; 전체 이력은 monitor:judg HASH)
 const MONITOR_INTERVAL_MS = 60 * 1000;    // 인프로세스 폴링 주기 (외부 cron 보조)
 
 function lastDayOfMonth(year, month) {
@@ -128,9 +143,17 @@ function todayLocalDt() {
 // KST(UTC+9) 기준 '오늘' 날짜. Render는 UTC로 동작하므로 서버 로컬시각으로 '오늘'을
 // 계산하면 KST 00:00~09:00 사이 등록분이 하루 늦은 날짜창에서 누락된다. getTime()은
 // 절대시각(TZ 무관)이라 +9h 후 getUTC*로 읽으면 서버 TZ와 무관하게 항상 KST 벽시계.
-function kstTodayDt() {
-  const k = new Date(Date.now() + 9 * 3600 * 1000);
+function kstDateFromTs(ts) {
+  const k = new Date(ts + 9 * 3600 * 1000);
   return k.getUTCFullYear() + '-' + String(k.getUTCMonth() + 1).padStart(2, '0') + '-' + String(k.getUTCDate()).padStart(2, '0');
+}
+function kstTodayDt() { return kstDateFromTs(Date.now()); }
+// KST 전체 일시 문자열 (엑셀 표시용)
+function kstTsString(ts) {
+  if (!ts) return '';
+  const k = new Date(ts + 9 * 3600 * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${k.getUTCFullYear()}-${p(k.getUTCMonth() + 1)}-${p(k.getUTCDate())} ${p(k.getUTCHours())}:${p(k.getUTCMinutes())}:${p(k.getUTCSeconds())}`;
 }
 
 // startDt부터 X일씩 자르기. 마지막 미완성 구간(< X일)은 버림.
@@ -1023,6 +1046,67 @@ async function rejectQuestion(token, serial) {
   return patch(`/v1/qna/${serial}/status/answer-no-admit`, token, payload);
 }
 
+// ── 판정 기록 durable 저장 (엑셀 export용 영구 이력) ──
+// 콜드부팅에도 살아남도록 Upstash HASH(field=일련번호)로 저장 → 같은 serial 재처리 시 자동 병합.
+// 키는 KST 날짜별(monitor:judg:YYYY-MM-DD), 90일 후 자동 만료. export는 날짜범위로 HVALS.
+const JUDG_TTL_SEC = 90 * 24 * 3600;
+function judgKey(dt) { return `monitor:judg:${dt}`; }
+async function appendJudgment(rec) {
+  const key = judgKey(kstDateFromTs(rec.ts));
+  const r = await upstashCmd('HSET', key, String(rec.serial), JSON.stringify(rec));
+  if (r != null) await upstashCmd('EXPIRE', key, JUDG_TTL_SEC);
+  return r != null;
+}
+async function readJudgments(startDt, endDt) {
+  const out = [];
+  for (let d = dtToDays(startDt); d <= dtToDays(endDt); d++) {
+    const vals = await upstashCmd('HVALS', judgKey(daysToDt(d)));
+    if (Array.isArray(vals)) for (const v of vals) { try { out.push(JSON.parse(v)); } catch {} }
+  }
+  out.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return out;
+}
+
+const MONITOR_ACTION_LABEL = { rejected: '실제 거절', would_reject: '거절예정(그림자)', shadow_ai: '그림자(AI)', reject_failed: '거절 실패', none: '통과' };
+async function buildMonitorWorkbook(recs) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'qna-report';
+  wb.created = new Date();
+  const sheet = wb.addWorksheet('검열판정');
+  sheet.columns = [
+    { header: '일시(KST)', key: 'ts', width: 20 },
+    { header: '일련번호', key: 'serial', width: 12 },
+    { header: '방식', key: 'division', width: 8 },
+    { header: 'TA ID', key: 'taId', width: 12 },
+    { header: 'TA 이름', key: 'taName', width: 12 },
+    { header: 'AI여부', key: 'ai', width: 8 },
+    { header: '질문 본문', key: 'text', width: 70 },
+    { header: '이미지수', key: 'imageCount', width: 9 },
+    { header: '분류', key: 'label', width: 10 },
+    { header: '신뢰도', key: 'confidence', width: 9 },
+    { header: '조치', key: 'action', width: 16 },
+  ];
+  sheet.getRow(1).font = { bold: true };
+  sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEEEEEE' } };
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+  for (const r of recs) {
+    sheet.addRow({
+      ts: kstTsString(r.ts),
+      serial: r.serial,
+      division: '온라인',
+      taId: r.taId || '',
+      taName: r.taName || '',
+      ai: r.isAI ? 'AI' : '사람',
+      text: r.text || '',
+      imageCount: r.imageCount || 0,
+      label: r.label || '',
+      confidence: (r.confidence != null && r.confidence > 0) ? Math.round(r.confidence * 100) + '%' : '',
+      action: MONITOR_ACTION_LABEL[r.action] || r.action || '',
+    });
+  }
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
 // (extractQuestionText — classifier.mjs)
 
 // 한 번의 폴링 틱: 답변대기(온라인) 신규 질문 분류 → 학습무관 거절/로그.
@@ -1051,6 +1135,7 @@ async function runMonitorTick(trigger) {
     if (!stats.byLabel) stats.byLabel = {};
     await parallelMap(fresh, async (it) => {
       const serial = it.qnaQuestionMasterSerialNo;
+      const isAI = AI_TA_IDS.has(it.taId); // aiowl 질문은 글로벌 auto여도 항상 그림자
       status.processed++;
       let label = '정상질문', confidence = 0, reason = '', action = 'none', err = null, classified = false, text = '', imageCount = 0;
       try {
@@ -1065,23 +1150,26 @@ async function runMonitorTick(trigger) {
       } catch (e) { err = e.message; reason = '조회/분류 오류'; }
       if (classified && shouldReject({ label, confidence })) {
         status.flagged++;
-        if (mode === 'auto') {
+        // 사람 TA 질문만 실제 거절. aiowl은 auto여도 그림자(shadow_ai)로만 기록.
+        if (mode === 'auto' && !isAI) {
           try { await rejectQuestion(token, serial); action = 'rejected'; status.rejected++; }
           catch (e) { action = 'reject_failed'; err = e.message; }
-        } else { action = 'would_reject'; }
+        } else { action = isAI ? 'shadow_ai' : 'would_reject'; }
       }
       if (classified) {
         seen.add(serial); // 분류 실패건은 seen에 안 넣어 다음 틱에 재시도
         stats.processed = (stats.processed || 0) + 1;
         stats.byLabel[label] = (stats.byLabel[label] || 0) + 1;
-        if (action === 'would_reject' || action === 'rejected' || action === 'reject_failed') stats.flagged = (stats.flagged || 0) + 1;
+        if (action !== 'none') stats.flagged = (stats.flagged || 0) + 1;
         if (action === 'rejected') stats.rejected = (stats.rejected || 0) + 1;
       }
-      log.unshift({ serial, taId: it.taId || '', taName: it.taName || '', text: text.slice(0, 300), imageCount, label, confidence, reason, mode, action, err, ts: Date.now() });
+      const entry = { serial, taId: it.taId || '', taName: it.taName || '', isAI, text: text.slice(0, 300), imageCount, label, confidence, reason, mode, action, err, ts: Date.now() };
+      log.unshift(entry);
+      if (classified) { try { await appendJudgment(entry); } catch {} } // 엑셀 export용 영구 이력
     }, MONITOR_CLASSIFY_CONCURRENCY);
-    diskSet('monitor:seen', Array.from(seen).slice(-MONITOR_SEEN_CAP));
-    diskSet('monitor:log', log.slice(0, MONITOR_LOG_CAP));
-    diskSet('monitor:stats', stats);
+    await diskSetDurable('monitor:seen', Array.from(seen).slice(-MONITOR_SEEN_CAP));
+    await diskSetDurable('monitor:log', log.slice(0, MONITOR_LOG_CAP));
+    await diskSetDurable('monitor:stats', stats);
     status.ok = true;
   } catch (e) {
     status.ok = false; status.error = e.message;
@@ -1343,6 +1431,51 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // 검열 판정 엑셀 내보내기 (영구 이력 monitor:judg에서 날짜범위 조회). token gate (학생 데이터 포함).
+  if (req.method === 'GET' && url.pathname === '/api/monitor/export') {
+    const token = url.searchParams.get('token');
+    if (!token) { json(res, 401, { error: 'token 필요' }); return; }
+    const start = url.searchParams.get('start'), end = url.searchParams.get('end');
+    if (!start || !end || !/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) {
+      json(res, 400, { error: 'start, end (YYYY-MM-DD, start<=end) 필요' }); return;
+    }
+    try {
+      const recs = await readJudgments(start, end);
+      const buf = await buildMonitorWorkbook(recs);
+      const filename = `검열판정_${start}_${end}.xlsx`;
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'Content-Length': buf.length,
+      });
+      res.end(buf);
+    } catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  // 거절 payload 통제 검증: 단건만 실제 거절 후 전후 상태 비교 (auto 전환 전 1회용). secret gate.
+  if (req.method === 'POST' && url.pathname === '/api/monitor/verify-reject') {
+    const okSecret = MONITOR_SECRET && url.searchParams.get('secret') === MONITOR_SECRET;
+    if (!okSecret) { json(res, 403, { error: 'secret 필요' }); return; }
+    const serial = parseInt(url.searchParams.get('serial'), 10);
+    if (!Number.isFinite(serial)) { json(res, 400, { error: 'serial 필요' }); return; }
+    try {
+      const token = await ensureMonitorToken();
+      const snap = async () => {
+        try {
+          const d = await get(`/v1/qna/${serial}`, token); const x = d && d.data;
+          return x ? { status: x.questionStatusCommonCode, statusName: x.questionStatusCommonCodeName, reasonCode: x.answerNoAdmittedReasonCommonCode, reasonName: x.answerNoAdmittedReasonCommonCodeName, reQuestionableYn: x.reQuestionableYn, taId: x.taId } : null;
+        } catch (e) { return { error: e.message }; }
+      };
+      const before = await snap();
+      let patchResult = null, patchError = null;
+      try { patchResult = await rejectQuestion(token, serial); } catch (e) { patchError = e.message; }
+      const after = await snap();
+      json(res, 200, { serial, before, after, patchError, payloadSent: { answerNoAdmittedReasonCommonCode: REJECT_REASON_CODE, answerNoAdmittedReasonDescription: REJECT_REASON_TEXT, reQuestionableYn: 'Y' }, patchResult });
+    } catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not Found');
 });
@@ -1585,6 +1718,14 @@ const HTML = `<!DOCTYPE html>
       <button class="btn" onclick="resetMonitor()">기록 초기화(재검사)</button>
       <label style="font-size:13px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px"><input type="checkbox" id="monAuto" checked> 30초 자동갱신</label>
     </div>
+    <div class="ctrl">
+      <span style="font-size:13px;color:#666">엑셀 내보내기:</span>
+      <input type="date" id="monExStart" style="padding:6px;border:1px solid #ddd;border-radius:6px">
+      <span style="color:#888">~</span>
+      <input type="date" id="monExEnd" style="padding:6px;border:1px solid #ddd;border-radius:6px">
+      <button class="btn" onclick="exportMonitor()">⬇ 엑셀 내보내기</button>
+      <span style="font-size:12px;color:#aaa">검열 판정 전체 이력 (최대 90일 보관)</span>
+    </div>
     <div id="monStatus" style="margin-bottom:12px;color:#666;font-size:13px"></div>
     <div id="monResult"></div>
   </div>
@@ -1670,6 +1811,7 @@ function switchTab(name) {
 // ── 질문 검열 감시 ──
 
 async function loadMonitor() {
+  initMonExportDates();
   if (!TOKEN) return;
   try {
     const res = await fetch('/api/monitor/log?token=' + encodeURIComponent(TOKEN));
@@ -1682,7 +1824,7 @@ async function loadMonitor() {
 
 function renderMonitor(d) {
   const ml = document.getElementById('monMode');
-  ml.textContent = d.mode === 'auto' ? '자동 거절 ON (실제 거절함)' : '그림자 (거절 안 함, 기록만)';
+  ml.textContent = d.mode === 'auto' ? '자동 거절 ON (사람 TA만 실거절 · aiowl은 그림자)' : '그림자 (거절 안 함, 기록만)';
   ml.style.color = d.mode === 'auto' ? '#c53030' : '#2b6cb0';
   let warn = '';
   if (!d.hasAuth) warn += '<div style="color:#c53030">⚠ 감시용 인증 없음 — 이 사이트에서 로그인하면 자동 저장됩니다.</div>';
@@ -1710,11 +1852,12 @@ function renderMonitor(d) {
     const color = l.label === '학습무관' ? '#c53030' : (l.label === '학습상담' ? '#2b6cb0' : '#718096');
     let act = '-';
     if (l.action === 'rejected') act = '<span style="color:#c53030;font-weight:700">거절됨</span>';
+    else if (l.action === 'shadow_ai') act = '<span style="color:#3182ce;font-weight:600">그림자(AI)</span>';
     else if (l.action === 'would_reject') act = '<span style="color:#dd6b20;font-weight:600">거절 예정(그림자)</span>';
     else if (l.action === 'reject_failed') act = '<span style="color:#c53030">거절 실패</span>';
     const conf = (l.confidence != null && l.confidence > 0) ? (l.confidence * 100).toFixed(0) + '%' : '';
     return '<tr><td style="white-space:nowrap">' + new Date(l.ts).toLocaleTimeString('ko-KR') +
-      '</td><td>' + l.serial + '</td><td>' + esc(l.taId || '') +
+      '</td><td>' + l.serial + '</td><td>' + esc(l.taId || '') + (l.isAI ? ' <span style="font-size:10px;background:#3182ce;color:#fff;padding:1px 4px;border-radius:3px">AI</span>' : '') +
       '</td><td style="max-width:460px">' + esc(l.text || '') +
       '</td><td style="color:' + color + ';font-weight:600;white-space:nowrap">' + esc(l.label || '') +
       '</td><td>' + conf + '</td><td style="white-space:nowrap">' + act +
@@ -1726,7 +1869,7 @@ function renderMonitor(d) {
 }
 
 async function setMonMode(m) {
-  if (m === 'auto' && !confirm('자동 거절을 켭니다. 학습무관으로 분류된 답변대기 질문이 실제로 답변불가 처리됩니다. 계속할까요?')) return;
+  if (m === 'auto' && !confirm('자동 거절을 켭니다. 사람 TA에게 간 학습무관 질문이 실제로 답변불가 처리됩니다(aiowl 질문은 그림자 유지). 계속할까요?')) return;
   try {
     await fetch('/api/monitor/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN, mode: m }) });
   } catch (e) {}
@@ -1744,6 +1887,29 @@ async function resetMonitor() {
   try { await fetch('/api/monitor/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) }); } catch (e) {}
   document.getElementById('monStatus').textContent = '초기화됨 — "지금 1회 검사"로 다시 분류하세요.';
   loadMonitor();
+}
+
+// ── 엑셀 내보내기 (검열 판정 영구 이력) ──
+function monYmd(d) { const p = n => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); }
+function initMonExportDates() {
+  const s = document.getElementById('monExStart'), e = document.getElementById('monExEnd');
+  if (s && !s.value) { const d = new Date(); d.setDate(d.getDate() - 6); s.value = monYmd(d); }
+  if (e && !e.value) e.value = monYmd(new Date());
+}
+async function exportMonitor() {
+  if (!TOKEN) return;
+  const s = document.getElementById('monExStart').value, e = document.getElementById('monExEnd').value;
+  if (!s || !e) { alert('시작/종료 날짜를 선택하세요'); return; }
+  try {
+    const res = await fetch('/api/monitor/export?token=' + encodeURIComponent(TOKEN) + '&start=' + s + '&end=' + e);
+    if (!res.ok) { alert('내보내기 실패: ' + (await res.text())); return; }
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '검열판정_' + s + '_' + e + '.xlsx';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch (err) { alert('내보내기 오류: ' + err.message); }
 }
 
 setInterval(function () {

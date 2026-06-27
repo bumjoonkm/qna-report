@@ -18,7 +18,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // ── 분류 기준 노브 ──────────────────────────────────────────────────────
 export const MONITOR_MODEL = process.env.MONITOR_MODEL || 'claude-haiku-4-5';
-export const MONITOR_CONFIDENCE_THRESHOLD = 0.85; // 학습무관 거절 최소 신뢰도 (고정밀: 오거절 방지)
+export const MONITOR_CONFIDENCE_THRESHOLD = 0.90; // 학습무관 자동거절 최소 신뢰도 (사람 TA 실거절 기준 상향: 오거절 방지)
 export const MONITOR_IMG_GUARD_MAXLEN = 4;        // 이미지 첨부 + 본문 이 길이 이하(아주 짧은 캡션: "이거요" 등)면 LLM 없이 정상질문. 그 이상은 LLM이 판정(맛집/잡담 등 학습무관 포착, 예: "밥집 추천좀 해주세여")
 
 // 라벨 (분류 결과 3종). 변경 시 server.mjs의 표시/통계 키도 함께 확인할 것.
@@ -63,8 +63,8 @@ export const MONITOR_SYS_PROMPT = [
   '   - 본문 밖(이미지)에 질문이 있음을 암시: "문제에 질문 같이 썼어요", "질문 적어뒀습니다", "사진에 적었어요".',
   '   - 인사·막연한 요청·짧은 단편 입력: "안녕하세요 풀이 부탁드립니다", "어떻게 해야 해?", "자세하게 설명해주세요", "도와주세요", "답이 뭐예요", "." 나 "d" 같은 한두 글자.',
   '',
-  '반드시 아래 JSON 한 줄만 출력한다(다른 말 금지):',
-  '{"label":"학습무관|학습상담|정상질문","confidence":0~1 사이 숫자,"reason":"짧은 근거"}',
+  '반드시 아래 JSON 한 줄만 출력한다(다른 말·설명·사유 금지):',
+  '{"label":"학습무관|학습상담|정상질문","confidence":0~1 사이 숫자}',
 ].join('\n');
 
 // ── 질문 본문 추출 (질문을 "읽는" 부분) ─────────────────────────────────
@@ -104,7 +104,7 @@ async function classifyViaLLM(text, imageCount = 0) {
         },
         body: JSON.stringify({
           model: MONITOR_MODEL,
-          max_tokens: 200,
+          max_tokens: 32,
           system: MONITOR_SYS_PROMPT,
           messages: [{ role: 'user', content: userContent }],
         }),
@@ -121,7 +121,7 @@ async function classifyViaLLM(text, imageCount = 0) {
     const m = out.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('파싱 실패');
     const j = JSON.parse(m[0]);
-    return { label: j.label, confidence: Number(j.confidence) || 0, reason: j.reason || '' };
+    return { label: j.label, confidence: Number(j.confidence) || 0 };
   }
   throw lastErr || new Error('anthropic 재시도 모두 실패');
 }
@@ -137,7 +137,7 @@ export async function classify(text, imageCount) {
     return { label: LABELS.NORMAL, confidence: 1, reason: `이미지 ${imageCount}장 + 짧은 본문(${text.length}자) → 이미지 질문`, viaLLM: false };
   }
   const c = await classifyViaLLM(text, imageCount);
-  return { ...c, viaLLM: true };
+  return { ...c, reason: '', viaLLM: true };
 }
 
 // ── 거절 판정 ───────────────────────────────────────────────────────────
