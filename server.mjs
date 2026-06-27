@@ -1245,11 +1245,14 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/verify') {
-    const { accountId, accountPassword, certNo } = JSON.parse(await readBody(req));
+    const { accountId, accountPassword, certNo, asMonitor } = JSON.parse(await readBody(req));
     const result = await post('/v1/manager/auth/token', { accountId, accountPassword, certNo });
     if (result.code === 'R20000' && result.data) {
-      await saveMonitorAuth(result.data); // 감시기용 토큰(refresh 포함) 영속 저장
-      json(res, 200, { ok: true, accessToken: result.data.accessToken });
+      // 감시기 토큰은 asMonitor=true일 때만 저장한다. 일반 리포트 로그인(웹 폼)은 이 플래그를
+      // 안 보내므로 감시기 전용계정 토큰을 덮어쓰지 않는다(단일세션 충돌 회피 핵심). 전용계정
+      // 등록은 dedicated 계정 자격증명 + 2FA로 asMonitor:true 호출 1회로만 수행.
+      if (asMonitor) await saveMonitorAuth(result.data);
+      json(res, 200, { ok: true, accessToken: result.data.accessToken, monitorSet: !!asMonitor });
     } else {
       json(res, 200, { ok: false, message: result.message });
     }
