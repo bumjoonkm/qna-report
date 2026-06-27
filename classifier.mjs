@@ -82,30 +82,48 @@ export function extractQuestionText(obj) {
 }
 
 // ── LLM 분류 1회 (프롬프트 적용 + 응답 파싱) ────────────────────────────
+// Anthropic API의 일시 오류(5xx/429/overloaded 529/네트워크)는 백오프 재시도로 흡수.
+// (영구 오류 4xx는 즉시 실패. 끝까지 실패하면 throw → tick은 seen에 안 넣고 다음 틱 재시도.)
+const ANTHROPIC_MAX_ATTEMPTS = 4;
+function isTransientStatus(s) { return s >= 500 || s === 429; }
+
 async function classifyViaLLM(text, imageCount = 0) {
   if (!ANTHROPIC_API_KEY) throw new Error('NO_API_KEY');
   const userContent = `첨부 이미지: ${imageCount > 0 ? imageCount + '장' : '없음'}\n질문 본문: ${text}`;
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: MONITOR_MODEL,
-      max_tokens: 200,
-      system: MONITOR_SYS_PROMPT,
-      messages: [{ role: 'user', content: userContent }],
-    }),
-  });
-  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`anthropic ${res.status} ${t.slice(0, 150)}`); }
-  const body = await res.json();
-  const out = (body.content || []).map(b => b.text || '').join('');
-  const m = out.match(/\{[\s\S]*\}/);
-  if (!m) throw new Error('파싱 실패');
-  const j = JSON.parse(m[0]);
-  return { label: j.label, confidence: Number(j.confidence) || 0, reason: j.reason || '' };
+  let lastErr;
+  for (let attempt = 0; attempt < ANTHROPIC_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) await new Promise(r => setTimeout(r, 500 * 2 ** (attempt - 1))); // 0.5s,1s,2s 백오프
+    let res;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: MONITOR_MODEL,
+          max_tokens: 200,
+          system: MONITOR_SYS_PROMPT,
+          messages: [{ role: 'user', content: userContent }],
+        }),
+      });
+    } catch (e) { lastErr = new Error('anthropic fetch: ' + e.message); continue; } // 네트워크 오류 → 재시도
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      const err = new Error(`anthropic ${res.status} ${t.slice(0, 150)}`);
+      if (isTransientStatus(res.status)) { lastErr = err; continue; }     // 5xx/429 → 재시도
+      throw err;                                                          // 4xx → 즉시 실패
+    }
+    const body = await res.json();
+    const out = (body.content || []).map(b => b.text || '').join('');
+    const m = out.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('파싱 실패');
+    const j = JSON.parse(m[0]);
+    return { label: j.label, confidence: Number(j.confidence) || 0, reason: j.reason || '' };
+  }
+  throw lastErr || new Error('anthropic 재시도 모두 실패');
 }
 
 // ── 분류 1건 (메인 진입점) ──────────────────────────────────────────────
