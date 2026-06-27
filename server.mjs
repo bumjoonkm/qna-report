@@ -1012,12 +1012,12 @@ async function saveMonitorAuth(data) {
   await diskSetDurable('monitor:auth', auth);
 }
 
-// 만료 임박 시 refresh로 2FA 없이 토큰 연장. 실패 시 'NEED_LOGIN'.
-async function ensureMonitorToken() {
+// refreshToken으로 access 토큰 강제 재발급(exp와 무관). 성공 시 새 토큰을 durable 저장 후 반환.
+// 공유 forestta 계정이 다른 곳에서 로그인하면 모니터의 access 토큰이 서버측에서 무효화되는데
+// (JWT exp는 미래라 ensureMonitorToken은 갱신 안 함) → API 401. 그 401을 이걸로 자가복구한다.
+async function refreshMonitorToken() {
   const auth = await diskGet('monitor:auth');
-  if (!auth || !auth.accessToken) throw new Error('NEED_LOGIN');
-  if (jwtExpMs(auth.accessToken) - Date.now() > 5 * 60 * 1000) return auth.accessToken;
-  if (!auth.refreshToken || auth.managerAccountSerialNo == null) throw new Error('NEED_LOGIN');
+  if (!auth || !auth.refreshToken || auth.managerAccountSerialNo == null) throw new Error('NEED_LOGIN');
   const r = await post('/v1/manager/auth/refresh', {
     managerAccountSerialNo: auth.managerAccountSerialNo,
     refreshToken: auth.refreshToken,
@@ -1030,6 +1030,25 @@ async function ensureMonitorToken() {
   const persisted = await diskSetDurable('monitor:auth', next);
   if (!persisted) console.warn('[monitor] refreshToken Upstash 영속 저장 실패 — 재배포/절전 시 재로그인 필요할 수 있음');
   return next.accessToken;
+}
+
+// refresh를 단일 in-flight로 직렬화. 동시(병렬 상세조회 등)에 여러 401이 나도
+// refresh는 한 번만 실행 → 회전형 refreshToken을 폐기본으로 재사용(R40110)하는 것 방지.
+let monitorRefreshInflight = null;
+function refreshMonitorTokenOnce() {
+  if (!monitorRefreshInflight) {
+    monitorRefreshInflight = refreshMonitorToken().finally(() => { monitorRefreshInflight = null; });
+  }
+  return monitorRefreshInflight;
+}
+
+// 만료 임박 시 refresh로 2FA 없이 토큰 연장. 실패 시 'NEED_LOGIN'.
+async function ensureMonitorToken() {
+  const auth = await diskGet('monitor:auth');
+  if (!auth || !auth.accessToken) throw new Error('NEED_LOGIN');
+  if (jwtExpMs(auth.accessToken) - Date.now() > 5 * 60 * 1000) return auth.accessToken;
+  if (!auth.refreshToken || auth.managerAccountSerialNo == null) throw new Error('NEED_LOGIN');
+  return refreshMonitorTokenOnce();
 }
 
 // (분류: classify / shouldReject — classifier.mjs)
@@ -1115,17 +1134,28 @@ async function runMonitorTick(trigger) {
   monitorRunning = true;
   const status = { lastTickAt: Date.now(), trigger, processed: 0, flagged: 0, rejected: 0, ok: false };
   try {
-    const token = await ensureMonitorToken();
+    let token = await ensureMonitorToken();
+    // 401 자가복구 래퍼: 공유계정 로그인으로 access 토큰이 무효화되면 get()이 'API 401'을
+    // 던진다 → 강제 refresh(단일 in-flight)로 새 토큰 받아 1회 재시도. token은 클로저로 공유돼
+    // 이후 호출(상세조회·거절 patch)도 갱신된 토큰을 쓴다.
+    const mget = async (path) => {
+      try { return await get(path, token); }
+      catch (e) {
+        if (!/API 401/.test(e.message || '')) throw e;
+        token = await refreshMonitorTokenOnce();
+        return await get(path, token); // 새 토큰으로 1회 재시도 (여전히 401이면 throw → 다음 틱 재시도)
+      }
+    };
     const mode = (await diskGet('monitor:mode')) || 'shadow';
     const end = kstTodayDt(); // KST 기준 오늘 (서버 UTC라 todayLocalDt면 자정 직후 누락)
     const start = daysToDt(dtToDays(end) - 1); // 어제~오늘 (밤사이 등록분 포함)
     const qs = `startDt=${start}&endDt=${end}&questionStatusCommonCode=${MONITOR_STATUS_WAIT}&questionDivisionCommonCode=${MONITOR_DIVISION}&searchType=taName`;
-    const first = await get(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&${qs}`, token);
+    const first = await mget(`/v1/qna/list?page=1&pageSize=${PAGE_SIZE}&${qs}`);
     const total = (first.data && first.data.totalCount) || 0;
     const pages = Math.ceil(total / PAGE_SIZE) || 1;
     const items = [...((first.data && first.data.contents) || [])];
     for (let p = 2; p <= pages; p++) {
-      const b = await get(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&${qs}`, token);
+      const b = await mget(`/v1/qna/list?page=${p}&pageSize=${PAGE_SIZE}&${qs}`);
       items.push(...((b.data && b.data.contents) || []));
     }
     const seen = new Set((await diskGet('monitor:seen')) || []);
@@ -1141,7 +1171,7 @@ async function runMonitorTick(trigger) {
       try {
         // 상세 조회해서 전체 questionContent + 첨부 이미지 수 확보 (list 축약/누락 방지)
         let detail = null;
-        try { const d = await get(`/v1/qna/${serial}`, token); detail = d && d.data; } catch (e) { err = '상세 조회 실패: ' + e.message; }
+        try { const d = await mget(`/v1/qna/${serial}`); detail = d && d.data; } catch (e) { err = '상세 조회 실패: ' + e.message; }
         text = extractQuestionText(detail) || extractQuestionText(it);
         imageCount = (detail && Array.isArray(detail.questionFiles)) ? detail.questionFiles.length : 0;
         if (err && !text && !imageCount) throw new Error(err); // 본문·첨부 둘 다 못 얻으면 분류 실패로 → 재시도
