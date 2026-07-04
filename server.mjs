@@ -1015,15 +1015,29 @@ async function saveMonitorAuth(data) {
 // refreshToken으로 access 토큰 강제 재발급(exp와 무관). 성공 시 새 토큰을 durable 저장 후 반환.
 // 공유 forestta 계정이 다른 곳에서 로그인하면 모니터의 access 토큰이 서버측에서 무효화되는데
 // (JWT exp는 미래라 ensureMonitorToken은 갱신 안 함) → API 401. 그 401을 이걸로 자가복구한다.
+let lastRefreshErr = null; // 진단용: 마지막 refresh 실패 사유 (자격증명 없음)
 async function refreshMonitorToken() {
   const auth = await diskGet('monitor:auth');
-  if (!auth || !auth.refreshToken || auth.managerAccountSerialNo == null) throw new Error('NEED_LOGIN');
-  const r = await post('/v1/manager/auth/refresh', {
-    managerAccountSerialNo: auth.managerAccountSerialNo,
-    refreshToken: auth.refreshToken,
-  });
+  if (!auth || !auth.refreshToken || auth.managerAccountSerialNo == null) {
+    lastRefreshErr = { at: Date.now(), reason: 'stored auth 불완전', hasRefreshToken: !!(auth && auth.refreshToken), managerSerialSet: auth?.managerAccountSerialNo != null };
+    throw new Error('NEED_LOGIN');
+  }
+  let r;
+  try {
+    r = await post('/v1/manager/auth/refresh', {
+      managerAccountSerialNo: auth.managerAccountSerialNo,
+      refreshToken: auth.refreshToken,
+    });
+  } catch (e) {
+    lastRefreshErr = { at: Date.now(), reason: 'refresh 요청 예외: ' + (e.message || '') };
+    throw new Error('NEED_LOGIN');
+  }
   const data = r && r.data;
-  if (!data || !data.accessToken || !data.refreshToken) throw new Error('NEED_LOGIN');
+  if (!data || !data.accessToken || !data.refreshToken) {
+    lastRefreshErr = { at: Date.now(), reason: 'refresh 응답에 토큰 없음', code: r?.code ?? null, message: r?.message ?? null, dataKeys: data ? Object.keys(data) : null };
+    throw new Error('NEED_LOGIN');
+  }
+  lastRefreshErr = null;
   // 회전형 1회용 토큰: refresh 성공 순간 옛 refreshToken은 폐기됨. 새 토큰을
   // Upstash에 확정 저장한 뒤 사용해야 dyno 교체 시 죽은 토큰을 물려받지 않는다.
   const next = { ...auth, accessToken: data.accessToken, refreshToken: data.refreshToken, savedAt: Date.now() };
@@ -1392,6 +1406,24 @@ const server = createServer(async (req, res) => {
     if (!okSecret && !token) { json(res, 403, { error: 'secret 또는 token 필요' }); return; }
     try { json(res, 200, await runMonitorTick(okSecret ? 'cron' : 'manual')); }
     catch (e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  // 임시 진단(인증 불필요, 자격증명 노출 없음): 토큰 만료시각·serial 설정 여부·refresh 실패 사유. 원인 파악 후 제거.
+  if (req.method === 'GET' && url.pathname === '/api/monitor/diag') {
+    const auth = await diskGet('monitor:auth');
+    const expMs = (auth && auth.accessToken) ? jwtExpMs(auth.accessToken) : 0;
+    json(res, 200, {
+      hasAuth: !!(auth && auth.accessToken),
+      managerSerialSet: !!(auth && auth.managerAccountSerialNo != null),
+      hasRefreshToken: !!(auth && auth.refreshToken),
+      authExpMs: expMs,
+      authExpInMin: expMs ? Math.round((expMs - Date.now()) / 60000) : null,
+      authSavedAt: (auth && auth.savedAt) || null,
+      authAgeMin: (auth && auth.savedAt) ? Math.round((Date.now() - auth.savedAt) / 60000) : null,
+      lastRefreshErr,
+      status: (await diskGet('monitor:status')) || null,
+    });
     return;
   }
 
