@@ -115,7 +115,7 @@ const MONITOR_SECRET = process.env.MONITOR_SECRET || '';
 const MONITOR_STATUS_WAIT = 'QA120002';   // 답변대기 (스캔 대상 상태)
 const MONITOR_DIVISION = 'QA110002';      // 온라인 질문 (스캔 대상 구분)
 const REJECT_REASON_CODE = 'QA250004';    // 기타사유 (ETC) — 거절 처리 코드
-const REJECT_REASON_TEXT = '부적절한 질문';
+const REJECT_REASON_TEXT = '자동 질문 거절처리 되었습니다. 질문 수정 후 다시 질문해주세요.\n(ex. 단순 감정적인 질문, 장난스러운 질문, 학습범위 밖의 내용이 포함된 질문, TA 신변/사담, 오락 자료 요청, 과목 무관 잡상식, 생활 잡담 등)';
 const MONITOR_CLASSIFY_CONCURRENCY = 5;
 const MONITOR_SEEN_CAP = 20000;          // 하루치 답변대기 중복처리 방지
 const MONITOR_LOG_CAP = 500;             // UI 최근 로그 상한 (durable 저장; 전체 이력은 monitor:judg HASH)
@@ -1095,6 +1095,8 @@ async function buildMonitorWorkbook(recs) {
   sheet.columns = [
     { header: '일시(KST)', key: 'ts', width: 20 },
     { header: '일련번호', key: 'serial', width: 12 },
+    { header: '관', key: 'branch', width: 10 },
+    { header: '학생', key: 'student', width: 12 },
     { header: '방식', key: 'division', width: 8 },
     { header: 'TA ID', key: 'taId', width: 12 },
     { header: 'TA 이름', key: 'taName', width: 12 },
@@ -1112,6 +1114,8 @@ async function buildMonitorWorkbook(recs) {
     sheet.addRow({
       ts: kstTsString(r.ts),
       serial: r.serial,
+      branch: r.branch || '',
+      student: r.student || '',
       division: '온라인',
       taId: r.taId || '',
       taName: r.taName || '',
@@ -1193,7 +1197,7 @@ async function runMonitorTick(trigger) {
         if (action !== 'none') stats.flagged = (stats.flagged || 0) + 1;
         if (action === 'rejected') stats.rejected = (stats.rejected || 0) + 1;
       }
-      const entry = { serial, taId: it.taId || '', taName: it.taName || '', isAI, text: text.slice(0, 300), imageCount, label, confidence, reason, mode, action, err, ts: Date.now() };
+      const entry = { serial, branch: it.studentErpBranchCodeName || '', student: it.memberName || '', taId: it.taId || '', taName: it.taName || '', isAI, text: text.slice(0, 300), imageCount, label, confidence, reason, mode, action, err, ts: Date.now() };
       log.unshift(entry);
       if (classified) { try { await appendJudgment(entry); } catch {} } // 엑셀 export용 영구 이력
     }, MONITOR_CLASSIFY_CONCURRENCY);
