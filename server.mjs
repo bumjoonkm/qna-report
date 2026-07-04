@@ -1266,11 +1266,13 @@ const server = createServer(async (req, res) => {
     const { accountId, accountPassword, certNo, asMonitor } = JSON.parse(await readBody(req));
     const result = await post('/v1/manager/auth/token', { accountId, accountPassword, certNo });
     if (result.code === 'R20000' && result.data) {
-      // 감시기 토큰은 asMonitor=true일 때만 저장한다. 일반 리포트 로그인(웹 폼)은 이 플래그를
-      // 안 보내므로 감시기 전용계정 토큰을 덮어쓰지 않는다(단일세션 충돌 회피 핵심). 전용계정
-      // 등록은 dedicated 계정 자격증명 + 2FA로 asMonitor:true 호출 1회로만 수행.
-      if (asMonitor) await saveMonitorAuth(result.data);
-      json(res, 200, { ok: true, accessToken: result.data.accessToken, monitorSet: !!asMonitor });
+      // 전용 감시기 계정이 없으므로(모니터도 forestta 공유) 사이트 로그인마다 감시기 토큰을 재시드한다.
+      // forestta로 새로 로그인하면 서버가 계정의 refresh 패밀리를 리셋 → 감시기의 기존 refreshToken이
+      // R40110으로 죽는데, 바로 이 로그인의 신선한 토큰으로 덮어써야 감시기가 계속 산다. (사람이 리포트를
+      // 볼 때마다 감시기 재시드 → 전용계정 없이 상시가동 유지. asMonitor 분리(135f9b6)는 전용계정 전제라
+      // 지금은 오히려 해가 됨: 로그인이 감시기 토큰을 죽이기만 하고 재시드 안 함 → NEED_LOGIN.)
+      await saveMonitorAuth(result.data);
+      json(res, 200, { ok: true, accessToken: result.data.accessToken, monitorSet: true });
     } else {
       json(res, 200, { ok: false, message: result.message });
     }
