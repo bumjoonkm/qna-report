@@ -103,6 +103,10 @@ const BRANCHES = [
   { code: 'Z6', name: 'W관' },
   { code: 'Y1', name: '목동관' },
   { code: 'G1', name: '기숙관' },
+  { code: 'Z11', name: '3H관' },
+  { code: 'Z5', name: '브릿지관' },
+  { code: 'Y2', name: '목동W관' },
+  { code: 'Z4', name: 'S관' },
 ];
 
 const AI_TA_IDS = new Set(['aiowl']);
@@ -1303,7 +1307,7 @@ const server = createServer(async (req, res) => {
     const year = parseInt(url.searchParams.get('year'));
     const month = parseInt(url.searchParams.get('month'));
     if (!token || !year || !month) { json(res, 400, { error: 'token, year, month 필요' }); return; }
-    try { json(res, 200, await cached(`salary:v2:${year}:${month}`, () => fetchSalaryAll(token, year, month))); }
+    try { json(res, 200, await cached(`salary:v3:${year}:${month}`, () => fetchSalaryAll(token, year, month))); }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
