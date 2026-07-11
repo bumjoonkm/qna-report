@@ -2745,14 +2745,39 @@ const salaryTotalsPlugin = {
       if (stacks.gRef)  ctx.fillText('₩' + stacks.gRef.total.toLocaleString(),  stacks.gRef.x,  stacks.gRef.y  - 8);
       const mo = months[i];
       if (!mo) return;
-      if (mo.savingsPct !== null && stacks.gPrev && stacks.gRef) {
+      if (stacks.gPrev && stacks.gRef) {
         const cx = (stacks.gPrev.x + stacks.gRef.x) / 2;
-        const cy = Math.min(stacks.gPrev.y, stacks.gRef.y) - 28;
-        const pct = mo.savingsPct;
-        const label = pct >= 0 ? pct.toFixed(1) + '% 감축' : Math.abs(pct).toFixed(1) + '% 증가';
-        ctx.fillStyle = pct >= 0 ? '#D9534F' : '#888';
-        ctx.font = 'bold 15px sans-serif';
-        ctx.fillText(label, cx, cy);
+        const topY = Math.min(stacks.gPrev.y, stacks.gRef.y);
+        if (mo.savingsPct !== null) {
+          const pct = mo.savingsPct;
+          ctx.fillStyle = pct >= 0 ? '#D9534F' : '#888';
+          ctx.font = 'bold 15px sans-serif';
+          ctx.fillText(pct >= 0 ? pct.toFixed(1) + '% 감축' : Math.abs(pct).toFixed(1) + '% 증가', cx, topY - 46);
+        }
+        // 카테고리별 감축률 — Meet는 대면끼리(Meet On 제외), 온라인은 AI 포함 합계끼리
+        const parts = [];
+        if (!mo.prev.meetError && !mo.ref.meetError && mo.prev.meet > 0) {
+          const p = (mo.prev.meet - mo.ref.meet) / mo.prev.meet * 100;
+          parts.push({ text: 'Meet ' + Math.abs(p).toFixed(1) + '%' + (p >= 0 ? '↓' : '↑'), down: p >= 0 });
+        }
+        if (mo.prev.online > 0) {
+          const p = (mo.prev.online - mo.ref.online) / mo.prev.online * 100;
+          parts.push({ text: '온라인 ' + Math.abs(p).toFixed(1) + '%' + (p >= 0 ? '↓' : '↑'), down: p >= 0 });
+        }
+        if (parts.length > 0) {
+          ctx.font = 'bold 10px sans-serif';
+          const gap = 10;
+          const widths = parts.map(p => ctx.measureText(p.text).width);
+          const totalW = widths.reduce((s, w) => s + w, 0) + gap * (parts.length - 1);
+          let px = cx - totalW / 2;
+          ctx.textAlign = 'left';
+          parts.forEach((p, idx) => {
+            ctx.fillStyle = p.down ? '#D9534F' : '#888';
+            ctx.fillText(p.text, px, topY - 31);
+            px += widths[idx] + gap;
+          });
+          ctx.textAlign = 'center';
+        }
       }
     });
     ctx.restore();
