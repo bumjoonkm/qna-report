@@ -765,8 +765,10 @@ async function fetchMeetSettleMonth(token, year, month, online) {
       count++;
     }
     const out = { total, count };
-    // 빈 응답은 영구 캐시 금지 — 월초에 정산 미입력 상태가 영원히 0으로 굳는 것 방지
-    if (monthEnd < today && rows.length > 0) diskSet(cacheKey, out);
+    // 빈 응답은 최근 완료월엔 캐시 금지(월초 정산 미입력이 0으로 굳는 것 방지).
+    // 월말이 45일 넘게 지났으면 진짜 0건(예: 25년 Meet On 미운영)으로 보고 영구 캐시.
+    const agedOut = dtToDays(today) - dtToDays(monthEnd) > 45;
+    if (monthEnd < today && (rows.length > 0 || agedOut)) diskSet(cacheKey, out);
     return out;
   } catch (e) {
     console.error(`meetsettle ${ym}${online ? '-on' : ''}: ${e.message}`);
@@ -809,6 +811,7 @@ async function fetchSalaryCompare(token, endMonth) {
     jobs.push({ m, kind: 'prevOnline', run: () => fetchSettleMonth(token, prevYear, m) });
     jobs.push({ m, kind: 'refOnline', run: () => fetchSettleMonth(token, refYear, m) });
     jobs.push({ m, kind: 'prevMeet', run: () => fetchMeetSettleMonth(token, prevYear, m, false) });
+    jobs.push({ m, kind: 'prevMeetOn', run: () => fetchMeetSettleMonth(token, prevYear, m, true) });
     jobs.push({ m, kind: 'refMeet', run: () => fetchMeetSettleMonth(token, refYear, m, false) });
     jobs.push({ m, kind: 'refMeetOn', run: () => fetchMeetSettleMonth(token, refYear, m, true) });
   }
@@ -830,10 +833,11 @@ async function fetchSalaryCompare(token, endMonth) {
     const aiKrw = Math.round((aiUsdByMonth[m] || 0) * USD_TO_KRW);
     const prev = {
       meet: meetVal(r.prevMeet),
+      meetOn: meetVal(r.prevMeetOn),
       online: sumOnlineMonth(r.prevOnline, prevYear, m),
-      meetError: meetBad(r.prevMeet),
+      meetError: meetBad(r.prevMeet) || meetBad(r.prevMeetOn),
     };
-    prev.total = prev.meet + prev.online;
+    prev.total = prev.meet + prev.meetOn + prev.online;
     const onlineHuman = sumOnlineMonth(r.refOnline, refYear, m);
     const ref = {
       meet: meetVal(r.refMeet),
@@ -845,7 +849,7 @@ async function fetchSalaryCompare(token, endMonth) {
     };
     ref.total = ref.meet + ref.meetOn + ref.online;
     const savingsPct = prev.total > 0 ? ((prev.total - ref.total) / prev.total) * 100 : null;
-    const meetErrMsg = [r.prevMeet, r.refMeet, r.refMeetOn].map(x => x && x.error).find(Boolean);
+    const meetErrMsg = [r.prevMeet, r.prevMeetOn, r.refMeet, r.refMeetOn].map(x => x && x.error).find(Boolean);
     return { month: m, prev, ref, savingsPct, meetErrMsg };
   });
 
@@ -2748,35 +2752,28 @@ const salaryTotalsPlugin = {
       if (stacks.gPrev && stacks.gRef) {
         const cx = (stacks.gPrev.x + stacks.gRef.x) / 2;
         const topY = Math.min(stacks.gPrev.y, stacks.gRef.y);
+        const meetErr = mo.prev.meetError || mo.ref.meetError;
+        // 카테고리별 절약액 (25 − 26, 만원 단위) — 아꼈으면 빨강↓, 늘었으면 회색↑
+        const lines = [];
+        const addSave = (label, prevV, refV) => {
+          const d = prevV - refV;
+          lines.push({ text: label + ' ' + Math.abs(Math.round(d / 10000)).toLocaleString() + '만' + (d >= 0 ? '↓' : '↑'), down: d >= 0 });
+        };
+        if (!meetErr) addSave('전체', mo.prev.total, mo.ref.total);
+        addSave('온라인', mo.prev.online, mo.ref.online);
+        if (!meetErr) {
+          addSave('Meet', mo.prev.meet, mo.ref.meet);
+          addSave('Meet On', mo.prev.meetOn || 0, mo.ref.meetOn);
+        }
+        ctx.font = 'bold 10px sans-serif';
+        lines.forEach((ln, li) => {
+          ctx.fillStyle = ln.down ? '#D9534F' : '#888';
+          ctx.fillText(ln.text, cx, topY - 31 - 13 * (lines.length - 1 - li));
+        });
         if (mo.savingsPct !== null) {
-          const pct = mo.savingsPct;
-          ctx.fillStyle = pct >= 0 ? '#D9534F' : '#888';
+          ctx.fillStyle = mo.savingsPct >= 0 ? '#D9534F' : '#888';
           ctx.font = 'bold 15px sans-serif';
-          ctx.fillText(pct >= 0 ? pct.toFixed(1) + '% 감축' : Math.abs(pct).toFixed(1) + '% 증가', cx, topY - 46);
-        }
-        // 카테고리별 감축률 — Meet는 대면끼리(Meet On 제외), 온라인은 AI 포함 합계끼리
-        const parts = [];
-        if (!mo.prev.meetError && !mo.ref.meetError && mo.prev.meet > 0) {
-          const p = (mo.prev.meet - mo.ref.meet) / mo.prev.meet * 100;
-          parts.push({ text: 'Meet ' + Math.abs(p).toFixed(1) + '%' + (p >= 0 ? '↓' : '↑'), down: p >= 0 });
-        }
-        if (mo.prev.online > 0) {
-          const p = (mo.prev.online - mo.ref.online) / mo.prev.online * 100;
-          parts.push({ text: '온라인 ' + Math.abs(p).toFixed(1) + '%' + (p >= 0 ? '↓' : '↑'), down: p >= 0 });
-        }
-        if (parts.length > 0) {
-          ctx.font = 'bold 10px sans-serif';
-          const gap = 10;
-          const widths = parts.map(p => ctx.measureText(p.text).width);
-          const totalW = widths.reduce((s, w) => s + w, 0) + gap * (parts.length - 1);
-          let px = cx - totalW / 2;
-          ctx.textAlign = 'left';
-          parts.forEach((p, idx) => {
-            ctx.fillStyle = p.down ? '#D9534F' : '#888';
-            ctx.fillText(p.text, px, topY - 31);
-            px += widths[idx] + gap;
-          });
-          ctx.textAlign = 'center';
+          ctx.fillText(mo.savingsPct >= 0 ? mo.savingsPct.toFixed(1) + '% 감축' : Math.abs(mo.savingsPct).toFixed(1) + '% 증가', cx, topY - 37 - 13 * lines.length);
         }
       }
     });
@@ -2834,13 +2831,14 @@ function renderSalaryCmpChart(data) {
   if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별)';
   const labels = months.map(mo => mo.month + '월');
   const maxTotal = Math.max(0, ...months.map(mo => Math.max(mo.prev.total, mo.ref.total)));
-  const yMax = Math.ceil((maxTotal * 1.3) / 1000000) * 1000000 || 1000000;
+  const yMax = Math.ceil((maxTotal * 1.5) / 1000000) * 1000000 || 1000000;
   const datasets = [
-    { label: prevSuffix + '년 TA Meet', backgroundColor: '#C8912E', stack: 'gPrev', data: months.map(mo => mo.prev.meet) },
     { label: prevSuffix + '년 온라인 답변', backgroundColor: '#F1BF42', stack: 'gPrev', data: months.map(mo => mo.prev.online) },
+    { label: prevSuffix + '년 TA Meet', backgroundColor: '#C8912E', stack: 'gPrev', data: months.map(mo => mo.prev.meet) },
+    { label: prevSuffix + '년 TA Meet On', backgroundColor: '#8F6A1E', stack: 'gPrev', data: months.map(mo => mo.prev.meetOn) },
+    { label: refSuffix + '년 온라인 답변 (AI 포함)', backgroundColor: '#F0908C', stack: 'gRef', data: months.map(mo => mo.ref.online) },
     { label: refSuffix + '년 TA Meet', backgroundColor: '#A94442', stack: 'gRef', data: months.map(mo => mo.ref.meet) },
     { label: refSuffix + '년 TA Meet On', backgroundColor: '#D9534F', stack: 'gRef', data: months.map(mo => mo.ref.meetOn) },
-    { label: refSuffix + '년 온라인 답변 (AI 포함)', backgroundColor: '#F0908C', stack: 'gRef', data: months.map(mo => mo.ref.online) },
   ].map(ds => Object.assign(ds, { borderColor: '#fff', borderWidth: { top: 2 } }));
   if (salaryCmpChartInstance) salaryCmpChartInstance.destroy();
   const ctx = document.getElementById('salcmpChart').getContext('2d');
@@ -2859,7 +2857,7 @@ function renderSalaryCmpChart(data) {
             label: (item) => {
               const mo = months[item.dataIndex];
               const base = item.dataset.label + ': ₩' + (item.raw || 0).toLocaleString();
-              if (item.datasetIndex === 4) {
+              if (item.datasetIndex === 3) {
                 return [base, '· 인간 TA ₩' + mo.ref.onlineHuman.toLocaleString(), '· AI (아이올) ₩' + mo.ref.aiKrw.toLocaleString()];
               }
               return base;
@@ -2868,7 +2866,7 @@ function renderSalaryCmpChart(data) {
         },
         datalabels: {
           font: { weight: 'bold', size: 11 }, textAlign: 'center',
-          color: (c) => c.datasetIndex === 1 ? '#6b4a00' : (c.datasetIndex === 4 ? '#7e2a26' : '#fff'),
+          color: (c) => c.datasetIndex === 0 ? '#6b4a00' : (c.datasetIndex === 3 ? '#7e2a26' : '#fff'),
           display: (c) => (c.dataset.data[c.dataIndex] || 0) >= yMax * 0.04,
           formatter: (val) => salcmpManwon(val),
         },
