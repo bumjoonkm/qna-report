@@ -2051,6 +2051,7 @@ function switchTab(name) {
   document.querySelector('.tab[onclick*="' + name + '"]').classList.add('active');
   document.getElementById('page-' + name).classList.add('active');
   if (name === 'monitor') loadMonitor();
+  if (name === 'salarycmp' && TOKEN && !salaryCmpChartInstance) doSalaryCompare();
 }
 
 // ── 질문 검열 감시 ──
