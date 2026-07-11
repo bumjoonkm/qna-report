@@ -720,8 +720,26 @@ async function fetchSettleForRange(token, startDt, endDt) {
 
 // ── TA Meet 정산 (급여 총 비교) ──
 
+// /v1/ta/settle/work/detail 은 Bearer만으로는 일부 환경(Render 등)에서 거부됨 —
+// 거절 PATCH와 동일하게 브라우저형 헤더(Origin/Referer/UA)를 붙여 호출.
+async function getMeetApi(path, token, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(`${API}${path}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Origin': 'https://qna-admin.hiconsysvc.com',
+        'Referer': 'https://qna-admin.hiconsysvc.com/',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+      },
+    });
+    if (res.ok) return res.json();
+    if (res.status === 500 && i < retries - 1) { await new Promise(r => setTimeout(r, 1000 * (i + 1))); continue; }
+    throw new Error(`API ${res.status}`);
+  }
+}
+
 // /v1/ta/settle/work/detail 월별 정산. online=false → 대면(TA Meet), true → TA Meet On.
-// 실패 시 null 반환 — "성공했지만 0원"과 구분해야 25년 데이터 부재가 조용히 0으로 그려지지 않음.
+// 실패 시 { error } 반환 — "성공했지만 0원"과 구분해야 25년 데이터 부재가 조용히 0으로 그려지지 않음.
 async function fetchMeetSettleMonth(token, year, month, online) {
   const ym = `${year}-${String(month).padStart(2, '0')}`;
   const cacheKey = `meetsettle-v1-${ym}${online ? '-on' : ''}`;
@@ -732,7 +750,7 @@ async function fetchMeetSettleMonth(token, year, month, online) {
     if (c) return c;
   }
   try {
-    const res = await get(`/v1/ta/settle/work/detail?year=${year}&month=${month}&workDivisionCommonCode=QA510001${online ? '&onlineYn=Y' : ''}`, token);
+    const res = await getMeetApi(`/v1/ta/settle/work/detail?year=${year}&month=${month}&workDivisionCommonCode=QA510001${online ? '&onlineYn=Y' : ''}`, token);
     const rows = Array.isArray(res?.data) ? res.data : (res?.data?.contents ?? res?.data?.works ?? []);
     let total = 0, count = 0;
     for (const r of rows) {
@@ -751,7 +769,8 @@ async function fetchMeetSettleMonth(token, year, month, online) {
     if (monthEnd < today && rows.length > 0) diskSet(cacheKey, out);
     return out;
   } catch (e) {
-    return null;
+    console.error(`meetsettle ${ym}${online ? '-on' : ''}: ${e.message}`);
+    return { error: e.message };
   }
 }
 
@@ -804,27 +823,30 @@ async function fetchSalaryCompare(token, endMonth) {
     return t;
   };
 
+  const meetVal = (x) => (x && !x.error) ? x.total : 0;
+  const meetBad = (x) => !x || !!x.error;
   const out = months.map((m) => {
     const r = byMonth[m];
     const aiKrw = Math.round((aiUsdByMonth[m] || 0) * USD_TO_KRW);
     const prev = {
-      meet: r.prevMeet ? r.prevMeet.total : 0,
+      meet: meetVal(r.prevMeet),
       online: sumOnlineMonth(r.prevOnline, prevYear, m),
-      meetError: r.prevMeet === null,
+      meetError: meetBad(r.prevMeet),
     };
     prev.total = prev.meet + prev.online;
     const onlineHuman = sumOnlineMonth(r.refOnline, refYear, m);
     const ref = {
-      meet: r.refMeet ? r.refMeet.total : 0,
-      meetOn: r.refMeetOn ? r.refMeetOn.total : 0,
+      meet: meetVal(r.refMeet),
+      meetOn: meetVal(r.refMeetOn),
       onlineHuman,
       aiKrw,
       online: onlineHuman + aiKrw,
-      meetError: r.refMeet === null || r.refMeetOn === null,
+      meetError: meetBad(r.refMeet) || meetBad(r.refMeetOn),
     };
     ref.total = ref.meet + ref.meetOn + ref.online;
     const savingsPct = prev.total > 0 ? ((prev.total - ref.total) / prev.total) * 100 : null;
-    return { month: m, prev, ref, savingsPct };
+    const meetErrMsg = [r.prevMeet, r.refMeet, r.refMeetOn].map(x => x && x.error).find(Boolean);
+    return { month: m, prev, ref, savingsPct, meetErrMsg };
   });
 
   return { refYear, prevYear, endRequested: endMonth, endEffective: effEnd, months: out };
@@ -2759,7 +2781,8 @@ async function doSalaryCompare() {
     } else {
       const msgs = [];
       if (data.endEffective < data.endRequested) msgs.push('TA Meet 정산이 확정된 ' + data.endEffective + '월까지만 표시합니다.');
-      if (data.months.some(mo => mo.prev.meetError || mo.ref.meetError)) msgs.push('일부 월의 TA Meet 정산 조회에 실패해 0으로 표시된 값이 있을 수 있습니다. 잠시 후 다시 조회해주세요.');
+      const errMo = data.months.find(mo => mo.prev.meetError || mo.ref.meetError);
+      if (errMo) msgs.push('일부 월의 TA Meet 정산 조회에 실패해 0으로 표시된 값이 있을 수 있습니다.' + (errMo.meetErrMsg ? ' (' + errMo.meetErrMsg + ')' : '') + ' 잠시 후 다시 조회해주세요.');
       if (msgs.length > 0) { note.style.display = 'block'; note.textContent = msgs.join(' '); }
       renderSalaryCmpChart(data);
     }
