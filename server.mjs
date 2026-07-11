@@ -1515,7 +1515,16 @@ const server = createServer(async (req, res) => {
     if (!token || !end || end < 1 || end > 12) { json(res, 400, { error: 'token, end(1~12) 필요' }); return; }
     const kt = kstTodayDt();
     const effEnd = Math.min(end, parseInt(kt.slice(5, 7)) - 1);
-    try { json(res, 200, await cached(`salarycmp-v1:${kt.slice(0, 4)}:${effEnd}`, () => fetchSalaryCompare(token, end))); }
+    try {
+      const key = `salarycmp-v1:${kt.slice(0, 4)}:${effEnd}`;
+      const hasMeetError = (d) => (d.months || []).some(mo => mo.prev.meetError || mo.ref.meetError);
+      const hit = cache.get(key);
+      if (hit && Date.now() - hit.ts < CACHE_TTL && !hasMeetError(hit.data)) { json(res, 200, hit.data); return; }
+      const data = await fetchSalaryCompare(token, end);
+      // 일부 실패(토큰 만료 등)한 결과는 메모리 캐시에 남기지 않음 — 재조회 시 즉시 재시도
+      if (!hasMeetError(data)) cache.set(key, { data, ts: Date.now() });
+      json(res, 200, data);
+    }
     catch (e) { json(res, 500, { error: e.message }); }
     return;
   }
