@@ -2924,8 +2924,11 @@ function salcmpSummaryHtml(months) {
   const tot = on + meet + meetOn;
   if (tot === 0) return '';
   const pct = (v) => (v / tot * 100).toFixed(1) + '%';
-  const man = Math.round(Math.abs(tot) / 10000).toLocaleString();
-  return '지금까지 총 <b style="color:#D9534F">' + man + '만 원 ' + (tot >= 0 ? '절약' : '증가') + '</b>'
+  // 1억 이상은 "2억 8,520만 원" 형식으로
+  const man = Math.round(Math.abs(tot) / 10000);
+  const eok = Math.floor(man / 10000), rem = man % 10000;
+  const amount = eok > 0 ? (eok + '억' + (rem > 0 ? ' ' + rem.toLocaleString() + '만' : '') + ' 원') : man.toLocaleString() + '만 원';
+  return '지금까지 총 <b style="color:#D9534F">' + amount + ' ' + (tot >= 0 ? '절약' : '증가') + '</b>'
     + ' <span style="color:#888;font-size:13px">(온라인 ' + pct(on) + ' · Meet ' + pct(meet) + ' · Meet On ' + pct(meetOn) + ')</span>';
 }
 
