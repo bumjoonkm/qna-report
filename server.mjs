@@ -738,9 +738,57 @@ async function getMeetApi(path, token, retries = 3) {
   }
 }
 
-// /v1/ta/settle/work/detail 월별 정산. online=false → 대면(TA Meet), true → TA Meet On.
+// 확정 정산(/v1/settle/list) 월별 합계 — 기본급 + 근무량/몰입도 인센티브 포함 최종 지급액.
+// work/detail의 taMeetConsultationSettleAccountAmount는 기본급(시간×시급)만 담고 있어
+// 실제 지급액보다 8~21% 낮다 (25년 검증). 같은 필드명이지만 settle/list 쪽이 최종액.
+// 몰입도 확정 건이 없는 달은 null 반환 → 호출부가 work/detail(기본급만)로 폴백.
+async function fetchSettleListMonth(token, year, month) {
+  const ym = `${year}-${String(month).padStart(2, '0')}`;
+  const cacheKey = `settlelist-v1-${ym}`;
+  const today = todayLocalDt();
+  const monthEnd = `${ym}-${String(lastDayOfMonth(year, month)).padStart(2, '0')}`;
+  if (monthEnd < today) {
+    const c = await diskGet(cacheKey);
+    if (c) return c;
+  }
+  const det = await getMeetApi(`/v1/settle/immersion/list?basisYy=${year}&basisMm=${month}`, token);
+  const dets = Array.isArray(det?.data) ? det.data : [];
+  const d = dets.find(r => r.deleteYn !== 'Y' && String(r.basisYy) === String(year) && parseInt(r.basisMm, 10) === month);
+  if (!d) return null;
+  const res = await getMeetApi(`/v1/settle/list?immersionAmountDeterminationSerialNo=${d.immersionAmountDeterminationSerialNo}`, token);
+  const meetRows = res?.data?.settleAccountsSummationTaMeetList || [];
+  const meetOnRows = res?.data?.settleAccountsSummationTaMeetonList || [];
+  if (meetRows.length === 0 && meetOnRows.length === 0) return null;
+  const out = {
+    meet: { total: meetRows.reduce((s, r) => s + (Number(r.taMeetConsultationSettleAccountAmount) || 0), 0), count: meetRows.length },
+    meetOn: { total: meetOnRows.reduce((s, r) => s + (Number(r.taMeetonConsultationSettleAccountAmount) || 0), 0), count: meetOnRows.length },
+    final: d.settleAccountsStatusCommonCode === 'QA490004',
+  };
+  // 완료월 + 최종확정 상태(QA490004)일 때만 영구 캐시 — 미확정 인센티브가 0/일부로 굳지 않게
+  if (monthEnd < today && out.final) diskSet(cacheKey, out);
+  return out;
+}
+
+// 같은 달의 Meet/Meet On 잡 2개가 settle/list를 중복 호출하지 않도록 in-flight 공유
+const settleListInflight = new Map();
+function fetchSettleListMonthOnce(token, year, month) {
+  const key = `${year}-${month}`;
+  if (!settleListInflight.has(key)) {
+    settleListInflight.set(key, fetchSettleListMonth(token, year, month).finally(() => settleListInflight.delete(key)));
+  }
+  return settleListInflight.get(key);
+}
+
+// 월별 TA Meet 정산. online=false → 대면(TA Meet), true → TA Meet On.
+// 1순위: 확정 정산 settle/list (인센티브 포함). 없거나 실패 시 work/detail(기본급만) 폴백.
 // 실패 시 { error } 반환 — "성공했지만 0원"과 구분해야 25년 데이터 부재가 조용히 0으로 그려지지 않음.
 async function fetchMeetSettleMonth(token, year, month, online) {
+  try {
+    const sl = await fetchSettleListMonthOnce(token, year, month);
+    if (sl) return online ? sl.meetOn : sl.meet;
+  } catch (e) {
+    console.error(`settlelist ${year}-${month}: ${e.message} — work/detail 폴백`);
+  }
   const ym = `${year}-${String(month).padStart(2, '0')}`;
   const cacheKey = `meetsettle-v1-${ym}${online ? '-on' : ''}`;
   const today = todayLocalDt();
@@ -2950,7 +2998,7 @@ function renderSalaryCmpChart(data) {
   const prevSuffix = String(data.prevYear).slice(2);
   const refSuffix = String(data.refYear).slice(2);
   const titleEl = document.getElementById('salcmpTitle');
-  if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별) — ' + prevSuffix + '년 정산 API 계산 기준';
+  if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별) — 확정 정산 기준 (인센티브 포함)';
   const sumEl = document.getElementById('salcmpSummary');
   if (sumEl) sumEl.innerHTML = salcmpSummaryHtml(data.months);
   salaryCmpChartInstance = drawSalaryCmpChart('salcmpChart', salaryCmpChartInstance, data.months, prevSuffix + '년', refSuffix + '년');
