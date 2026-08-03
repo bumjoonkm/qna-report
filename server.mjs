@@ -776,6 +776,24 @@ async function fetchMeetSettleMonth(token, year, month, online) {
   }
 }
 
+// 실제 급여 지급 내역 (경영지원 정산 확정표 기준, 2026-08 전달분) — 단위: 원.
+// 정산 API 계산치와 별도의 "정답지". 비교 가능한 3개 항목(온라인질문/TA Meet/TA Meet On)만 담고
+// SA 멘토링·프로모션은 제외. 페이지 HTML에 하드코딩하지 않고 토큰이 필요한 API 응답에만 실어
+// 로그인한 사용자에게만 노출한다.
+const ACTUAL_SALARY = {
+  2025: {
+    3:  { online: 27598900, meet: 62873626, meetOn: 7854176 },
+    4:  { online: 58740900, meet: 74057134, meetOn: 18442657 },
+    5:  { online: 71695600, meet: 62801049, meetOn: 12611045 },
+    6:  { online: 62315100, meet: 47293997, meetOn: 7605271 },
+    7:  { online: 99019200, meet: 79361227, meetOn: 7203887 },
+    8:  { online: 86460900, meet: 74954515, meetOn: 11660953 },
+    9:  { online: 83227400, meet: 44956800, meetOn: 11181607 },
+    10: { online: 84144200, meet: 43540544, meetOn: 10083395 },
+    11: { online: 37278400, meet: 17775902, meetOn: 4623417 },
+  },
+};
+
 // 급여 총 비교: refYear(올해) vs prevYear(작년), 3월 ~ effEnd월(직전 완료월로 클램프) 월 단위.
 // 온라인 지출은 AI 현황 탭과 동일 경로(fetchSettleMonth + perf2 일별 캐시)를 재사용해 두 탭 숫자가 항상 일치.
 async function fetchSalaryCompare(token, endMonth) {
@@ -850,7 +868,10 @@ async function fetchSalaryCompare(token, endMonth) {
     ref.total = ref.meet + ref.meetOn + ref.online;
     const savingsPct = prev.total > 0 ? ((prev.total - ref.total) / prev.total) * 100 : null;
     const meetErrMsg = [r.prevMeet, r.prevMeetOn, r.refMeet, r.refMeetOn].map(x => x && x.error).find(Boolean);
-    return { month: m, prev, ref, savingsPct, meetErrMsg };
+    const act = (ACTUAL_SALARY[prevYear] || {})[m];
+    const prevActual = act ? { ...act, total: act.online + act.meet + act.meetOn } : null;
+    const actualSavingsPct = prevActual && prevActual.total > 0 ? ((prevActual.total - ref.total) / prevActual.total) * 100 : null;
+    return { month: m, prev, ref, savingsPct, meetErrMsg, prevActual, actualSavingsPct };
   });
 
   return { refYear, prevYear, endRequested: endMonth, endEffective: effEnd, months: out };
@@ -1917,6 +1938,11 @@ const HTML = `<!DOCTYPE html>
       <h2 id="salcmpTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:8px"></h2>
       <canvas id="salcmpChart" height="120"></canvas>
     </div>
+    <div class="section" style="padding:24px;margin-top:16px;display:none" id="salcmpActualCard">
+      <h2 id="salcmpActualTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:4px"></h2>
+      <div style="text-align:center;font-size:12px;color:#888;margin-bottom:8px">25년은 실제 급여 지급 확정 내역 기준 (온라인질문 + TA Meet + TA Meet On, SA 멘토링·프로모션 제외)</div>
+      <canvas id="salcmpActualChart" height="120"></canvas>
+    </div>
   </div>
 
   <!-- 별점 비교 -->
@@ -2723,6 +2749,7 @@ function renderAiDailyChart(daily) {
 // ── 급여 총 비교 ──
 
 let salaryCmpChartInstance = null;
+let salaryCmpActualChartInstance = null;
 
 const salaryTotalsPlugin = {
   id: 'salaryTotals',
@@ -2817,32 +2844,30 @@ async function doSalaryCompare() {
       if (errMo) msgs.push('일부 월의 TA Meet 정산 조회에 실패해 0으로 표시된 값이 있을 수 있습니다.' + (errMo.meetErrMsg ? ' (' + errMo.meetErrMsg + ')' : '') + ' 잠시 후 다시 조회해주세요.');
       if (msgs.length > 0) { note.style.display = 'block'; note.textContent = msgs.join(' '); }
       renderSalaryCmpChart(data);
+      renderSalaryCmpActualChart(data);
     }
   } catch (err) { alert('오류: ' + err.message); }
   btn.disabled = false;
   btn.textContent = '조회';
 }
 
-function renderSalaryCmpChart(data) {
-  const months = data.months;
-  const prevSuffix = String(data.prevYear).slice(2);
-  const refSuffix = String(data.refYear).slice(2);
-  const titleEl = document.getElementById('salcmpTitle');
-  if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별)';
+// 공용 드로어: months는 {month, prev:{online,meet,meetOn,total,meetError}, ref, savingsPct} 배열.
+// 계산치 차트와 실제 내역 차트가 동일한 스택/라벨/플러그인 구성을 공유한다.
+function drawSalaryCmpChart(canvasId, prevInstance, months, prevName, refName) {
   const labels = months.map(mo => mo.month + '월');
   const maxTotal = Math.max(0, ...months.map(mo => Math.max(mo.prev.total, mo.ref.total)));
   const yMax = Math.ceil((maxTotal * 1.5) / 1000000) * 1000000 || 1000000;
   const datasets = [
-    { label: prevSuffix + '년 온라인 답변', backgroundColor: '#F1BF42', stack: 'gPrev', data: months.map(mo => mo.prev.online) },
-    { label: prevSuffix + '년 TA Meet', backgroundColor: '#C8912E', stack: 'gPrev', data: months.map(mo => mo.prev.meet) },
-    { label: prevSuffix + '년 TA Meet On', backgroundColor: '#8F6A1E', stack: 'gPrev', data: months.map(mo => mo.prev.meetOn) },
-    { label: refSuffix + '년 온라인 답변 (AI 포함)', backgroundColor: '#F0908C', stack: 'gRef', data: months.map(mo => mo.ref.online) },
-    { label: refSuffix + '년 TA Meet', backgroundColor: '#A94442', stack: 'gRef', data: months.map(mo => mo.ref.meet) },
-    { label: refSuffix + '년 TA Meet On', backgroundColor: '#D9534F', stack: 'gRef', data: months.map(mo => mo.ref.meetOn) },
+    { label: prevName + ' 온라인 답변', backgroundColor: '#F1BF42', stack: 'gPrev', data: months.map(mo => mo.prev.online) },
+    { label: prevName + ' TA Meet', backgroundColor: '#C8912E', stack: 'gPrev', data: months.map(mo => mo.prev.meet) },
+    { label: prevName + ' TA Meet On', backgroundColor: '#8F6A1E', stack: 'gPrev', data: months.map(mo => mo.prev.meetOn) },
+    { label: refName + ' 온라인 답변 (AI 포함)', backgroundColor: '#F0908C', stack: 'gRef', data: months.map(mo => mo.ref.online) },
+    { label: refName + ' TA Meet', backgroundColor: '#A94442', stack: 'gRef', data: months.map(mo => mo.ref.meet) },
+    { label: refName + ' TA Meet On', backgroundColor: '#D9534F', stack: 'gRef', data: months.map(mo => mo.ref.meetOn) },
   ].map(ds => Object.assign(ds, { borderColor: '#fff', borderWidth: { top: 2 } }));
-  if (salaryCmpChartInstance) salaryCmpChartInstance.destroy();
-  const ctx = document.getElementById('salcmpChart').getContext('2d');
-  salaryCmpChartInstance = new Chart(ctx, {
+  if (prevInstance) prevInstance.destroy();
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  const chart = new Chart(ctx, {
     type: 'bar',
     data: { labels: labels, datasets: datasets },
     options: {
@@ -2853,7 +2878,7 @@ function renderSalaryCmpChart(data) {
         title: { display: false },
         tooltip: {
           callbacks: {
-            title: (items) => months[items[0].dataIndex].month + '월 (' + prevSuffix + '년 vs ' + refSuffix + '년)',
+            title: (items) => months[items[0].dataIndex].month + '월 (' + prevName + ' vs ' + refName + ')',
             label: (item) => {
               const mo = months[item.dataIndex];
               const base = item.dataset.label + ': ₩' + (item.raw || 0).toLocaleString();
@@ -2878,8 +2903,40 @@ function renderSalaryCmpChart(data) {
     },
     plugins: [ChartDataLabels, salaryTotalsPlugin],
   });
-  salaryCmpChartInstance.config._salMonths = months;
-  salaryCmpChartInstance.update();
+  chart.config._salMonths = months;
+  chart.update();
+  return chart;
+}
+
+function renderSalaryCmpChart(data) {
+  const prevSuffix = String(data.prevYear).slice(2);
+  const refSuffix = String(data.refYear).slice(2);
+  const titleEl = document.getElementById('salcmpTitle');
+  if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별) — ' + prevSuffix + '년 정산 API 계산 기준';
+  salaryCmpChartInstance = drawSalaryCmpChart('salcmpChart', salaryCmpChartInstance, data.months, prevSuffix + '년', refSuffix + '년');
+}
+
+// 실제 급여 내역(정답지) vs 올해 계산치 — prevActual이 있는 달만 표시.
+function renderSalaryCmpActualChart(data) {
+  const card = document.getElementById('salcmpActualCard');
+  if (!card) return;
+  const months = (data.months || []).filter(mo => mo.prevActual).map(mo => ({
+    month: mo.month,
+    prev: Object.assign({ meetError: false }, mo.prevActual),
+    ref: mo.ref,
+    savingsPct: mo.actualSavingsPct,
+  }));
+  if (months.length === 0) {
+    card.style.display = 'none';
+    if (salaryCmpActualChartInstance) { salaryCmpActualChartInstance.destroy(); salaryCmpActualChartInstance = null; }
+    return;
+  }
+  card.style.display = '';
+  const prevSuffix = String(data.prevYear).slice(2);
+  const refSuffix = String(data.refYear).slice(2);
+  const titleEl = document.getElementById('salcmpActualTitle');
+  if (titleEl) titleEl.textContent = '실제 ' + prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별)';
+  salaryCmpActualChartInstance = drawSalaryCmpChart('salcmpActualChart', salaryCmpActualChartInstance, months, prevSuffix + '년 실제', refSuffix + '년');
 }
 
 // ── 동영상 재활용 ──
