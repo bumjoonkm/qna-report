@@ -1931,6 +1931,7 @@ const HTML = `<!DOCTYPE html>
     <div class="ctrl">
       <select id="salcmpEnd"></select> <span>월까지</span>
       <button class="btn" id="salcmpBtn" onclick="doSalaryCompare()">조회</button>
+      <label style="font-size:13px;color:#555;margin-left:12px;cursor:pointer"><input type="checkbox" id="salcmpHideAmts" onchange="toggleSalcmpAmounts()" style="vertical-align:-2px;cursor:pointer"> 월별 절약액 숨기기</label>
       <span style="color:#888;font-size:12px;margin-left:8px">3월부터 · 월 단위 · TA Meet 정산이 확정된 지난달까지 표시</span>
     </div>
     <div id="salcmpNote" style="display:none;margin-bottom:12px;padding:10px 14px;background:#FFF7E6;border:1px solid #F1BF42;border-radius:6px;font-size:13px;color:#8a6d1a"></div>
@@ -2783,16 +2784,20 @@ const salaryTotalsPlugin = {
         const topY = Math.min(stacks.gPrev.y, stacks.gRef.y);
         const meetErr = mo.prev.meetError || mo.ref.meetError;
         // 카테고리별 절약액 (25 − 26, 만원 단위) — 아꼈으면 빨강↓, 늘었으면 회색↑
+        // "월별 절약액 숨기기" 체크 시 4줄 생략 (% 감축 라벨은 항상 표시)
+        const hideEl = document.getElementById('salcmpHideAmts');
         const lines = [];
-        const addSave = (label, prevV, refV) => {
-          const d = prevV - refV;
-          lines.push({ text: label + ' ' + Math.abs(Math.round(d / 10000)).toLocaleString() + '만' + (d >= 0 ? '↓' : '↑'), down: d >= 0 });
-        };
-        if (!meetErr) addSave('전체', mo.prev.total, mo.ref.total);
-        addSave('온라인', mo.prev.online, mo.ref.online);
-        if (!meetErr) {
-          addSave('Meet', mo.prev.meet, mo.ref.meet);
-          addSave('Meet On', mo.prev.meetOn || 0, mo.ref.meetOn);
+        if (!hideEl || !hideEl.checked) {
+          const addSave = (label, prevV, refV) => {
+            const d = prevV - refV;
+            lines.push({ text: label + ' ' + Math.abs(Math.round(d / 10000)).toLocaleString() + '만' + (d >= 0 ? '↓' : '↑'), down: d >= 0 });
+          };
+          if (!meetErr) addSave('전체', mo.prev.total, mo.ref.total);
+          addSave('온라인', mo.prev.online, mo.ref.online);
+          if (!meetErr) {
+            addSave('Meet', mo.prev.meet, mo.ref.meet);
+            addSave('Meet On', mo.prev.meetOn || 0, mo.ref.meetOn);
+          }
         }
         ctx.font = 'bold 10px sans-serif';
         lines.forEach((ln, li) => {
@@ -2923,13 +2928,22 @@ function salcmpSummaryHtml(months) {
   });
   const tot = on + meet + meetOn;
   if (tot === 0) return '';
-  const pct = (v) => (v / tot * 100).toFixed(1) + '%';
-  // 1억 이상은 "2억 8,520만 원" 형식으로
-  const man = Math.round(Math.abs(tot) / 10000);
+  const cat = (v) => salcmpEok(v) + (v >= 0 ? '↓' : '↑');
+  return '지금까지 총 <b style="color:#D9534F">' + salcmpEok(tot) + ' 원 ' + (tot >= 0 ? '절약' : '증가') + '</b>'
+    + ' <span style="color:#888;font-size:13px">(온라인 ' + cat(on) + ' · Meet ' + cat(meet) + ' · Meet On ' + cat(meetOn) + ')</span>';
+}
+
+// 1억 이상은 "2억 8,520만" 형식, 미만은 "9,500만"
+function salcmpEok(v) {
+  const man = Math.round(Math.abs(v) / 10000);
   const eok = Math.floor(man / 10000), rem = man % 10000;
-  const amount = eok > 0 ? (eok + '억' + (rem > 0 ? ' ' + rem.toLocaleString() + '만' : '') + ' 원') : man.toLocaleString() + '만 원';
-  return '지금까지 총 <b style="color:#D9534F">' + amount + ' ' + (tot >= 0 ? '절약' : '증가') + '</b>'
-    + ' <span style="color:#888;font-size:13px">(온라인 ' + pct(on) + ' · Meet ' + pct(meet) + ' · Meet On ' + pct(meetOn) + ')</span>';
+  return eok > 0 ? (eok + '억' + (rem > 0 ? ' ' + rem.toLocaleString() + '만' : '')) : man.toLocaleString() + '만';
+}
+
+// 월별 항목별 절약액 라벨 숨김 토글 — 플러그인이 체크 상태를 읽으므로 다시 그리기만 하면 됨
+function toggleSalcmpAmounts() {
+  if (salaryCmpChartInstance) salaryCmpChartInstance.update();
+  if (salaryCmpActualChartInstance) salaryCmpActualChartInstance.update();
 }
 
 function renderSalaryCmpChart(data) {
