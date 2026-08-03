@@ -1935,11 +1935,13 @@ const HTML = `<!DOCTYPE html>
     </div>
     <div id="salcmpNote" style="display:none;margin-bottom:12px;padding:10px 14px;background:#FFF7E6;border:1px solid #F1BF42;border-radius:6px;font-size:13px;color:#8a6d1a"></div>
     <div class="section" style="padding:24px">
-      <h2 id="salcmpTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:8px"></h2>
+      <h2 id="salcmpTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:4px"></h2>
+      <div id="salcmpSummary" style="text-align:center;font-size:14px;color:#333;margin-bottom:8px"></div>
       <canvas id="salcmpChart" height="120"></canvas>
     </div>
     <div class="section" style="padding:24px;margin-top:16px;display:none" id="salcmpActualCard">
       <h2 id="salcmpActualTitle" style="font-size:18px;font-weight:700;color:#333;text-align:center;margin-bottom:4px"></h2>
+      <div id="salcmpActualSummary" style="text-align:center;font-size:14px;color:#333;margin-bottom:4px"></div>
       <div style="text-align:center;font-size:12px;color:#888;margin-bottom:8px">25년은 실제 급여 지급 확정 내역 기준 (온라인질문 + TA Meet + TA Meet On, SA 멘토링·프로모션 제외)</div>
       <canvas id="salcmpActualChart" height="120"></canvas>
     </div>
@@ -2908,11 +2910,32 @@ function drawSalaryCmpChart(canvasId, prevInstance, months, prevName, refName) {
   return chart;
 }
 
+// 표시 중인 기간의 누적 절약액 + 항목별 기여 비율 한 줄. meetError 월은 0으로 깔려
+// 합계를 왜곡하므로 제외.
+function salcmpSummaryHtml(months) {
+  const ok = months.filter(mo => !(mo.prev.meetError || mo.ref.meetError));
+  if (ok.length === 0) return '';
+  let on = 0, meet = 0, meetOn = 0;
+  ok.forEach(mo => {
+    on += mo.prev.online - mo.ref.online;
+    meet += mo.prev.meet - mo.ref.meet;
+    meetOn += (mo.prev.meetOn || 0) - mo.ref.meetOn;
+  });
+  const tot = on + meet + meetOn;
+  if (tot === 0) return '';
+  const pct = (v) => (v / tot * 100).toFixed(1) + '%';
+  const man = Math.round(Math.abs(tot) / 10000).toLocaleString();
+  return '지금까지 총 <b style="color:#D9534F">' + man + '만 원 ' + (tot >= 0 ? '절약' : '증가') + '</b>'
+    + ' <span style="color:#888;font-size:13px">(온라인 ' + pct(on) + ' · Meet ' + pct(meet) + ' · Meet On ' + pct(meetOn) + ')</span>';
+}
+
 function renderSalaryCmpChart(data) {
   const prevSuffix = String(data.prevYear).slice(2);
   const refSuffix = String(data.refYear).slice(2);
   const titleEl = document.getElementById('salcmpTitle');
   if (titleEl) titleEl.textContent = prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별) — ' + prevSuffix + '년 정산 API 계산 기준';
+  const sumEl = document.getElementById('salcmpSummary');
+  if (sumEl) sumEl.innerHTML = salcmpSummaryHtml(data.months);
   salaryCmpChartInstance = drawSalaryCmpChart('salcmpChart', salaryCmpChartInstance, data.months, prevSuffix + '년', refSuffix + '년');
 }
 
@@ -2936,6 +2959,8 @@ function renderSalaryCmpActualChart(data) {
   const refSuffix = String(data.refYear).slice(2);
   const titleEl = document.getElementById('salcmpActualTitle');
   if (titleEl) titleEl.textContent = '실제 ' + prevSuffix + '년 vs ' + refSuffix + '년 TA 급여 총 지출 비교 (월별)';
+  const sumEl = document.getElementById('salcmpActualSummary');
+  if (sumEl) sumEl.innerHTML = salcmpSummaryHtml(months);
   salaryCmpActualChartInstance = drawSalaryCmpChart('salcmpActualChart', salaryCmpActualChartInstance, months, prevSuffix + '년 실제', refSuffix + '년');
 }
 
