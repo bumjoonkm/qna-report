@@ -387,34 +387,43 @@ const RATING_DIV_STATUS = {
   QA110002: 'QA120004',
 };
 
-// (date, division) 1일치: 리뷰 starScores 배열 + 답변완료 totalCount.
+// (date, division) 1일치: 인간/AI로 나눈 리뷰 starScores + 답변완료 totalCount.
+// AI 판별은 코드베이스 공통 규칙(taId === 'aiowl')을 따른다. 분모는 서버 필터
+// taAiYn=Y|N 으로 나눠 받는다 (전수 페이지네이션 불필요 — Y+N == 전체 검증 완료).
 // 과거일만 디스크 캐시 (immutable). 오늘일은 매번 fresh.
 async function fetchRatingDay(token, dt, division) {
   const today = todayLocalDt();
-  const cacheKey = `rating-day-v2-${division}-${dt}`;
+  const cacheKey = `rating-day-v3-${division}-${dt}`;
   const isPast = dt < today;
   if (isPast) {
     const c = await diskGet(cacheKey);
     if (c) return c;
   }
-  // 1) /v1/review/list 페이지네이션 → starScores 모음
-  const starScores = [];
+  // 1) /v1/review/list 페이지네이션 → 인간/AI별 starScores 모음
+  const starsHuman = [], starsAi = [];
+  const collect = (contents) => {
+    for (const r of (contents || [])) {
+      if (r.starScore == null) continue;
+      (AI_TA_IDS.has(r.taId) ? starsAi : starsHuman).push(r.starScore);
+    }
+  };
   const first = await get(`/v1/review/list?page=1&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&searchType=memberName`, token);
   const fd = first?.data || {};
   const reviewTotal = fd.totalElements ?? fd.totalCount ?? fd.total ?? 0;
-  for (const r of (fd.contents || [])) if (r.starScore != null) starScores.push(r.starScore);
+  collect(fd.contents);
   const pages = Math.ceil(reviewTotal / PAGE_SIZE);
   for (let p = 2; p <= pages; p++) {
     const body = await get(`/v1/review/list?page=${p}&pageSize=${PAGE_SIZE}&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&searchType=memberName`, token);
-    for (const r of (body?.data?.contents || [])) if (r.starScore != null) starScores.push(r.starScore);
+    collect(body?.data?.contents);
   }
-  // 2) 답변완료 분모 — division별로 status 코드 분기
+  // 2) 답변완료 분모 — division별로 status 코드 분기, 인간/AI 따로
   const statusFrag = RATING_DIV_STATUS[division];
-  const cnt = await get(`/v1/qna/list?page=1&pageSize=1&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&questionStatusCommonCode=${statusFrag}&searchType=taName`, token);
-  const cd = cnt?.data || {};
-  const resolvedCount = cd.totalElements ?? cd.totalCount ?? cd.total ?? 0;
+  const countUrl = (aiYn) => `/v1/qna/list?page=1&pageSize=1&startDt=${dt}&endDt=${dt}&questionDivisionCommonCode=${division}&questionStatusCommonCode=${statusFrag}&searchType=taName&taAiYn=${aiYn}`;
+  const [hCnt, aCnt] = await Promise.all([get(countUrl('N'), token), get(countUrl('Y'), token)]);
+  const num = (body) => { const d = body?.data || {}; return d.totalElements ?? d.totalCount ?? d.total ?? 0; };
+  const resolvedHuman = num(hCnt), resolvedAi = num(aCnt);
 
-  const result = { starScores, resolvedCount };
+  const result = { starsHuman, starsAi, resolvedHuman, resolvedAi };
   if (isPast) diskSet(cacheKey, result);
   return result;
 }
@@ -440,34 +449,37 @@ async function fetchRatingComparison(token, startDt, endDt) {
     return { ...t, ...r };
   }, CONCURRENCY);
 
-  function aggregate(filterFn) {
+  // who: 'human' | 'ai' | 'all'
+  function aggregate(filterFn, who) {
     const subset = results.filter(filterFn);
-    const allStars = subset.flatMap(s => s.starScores);
+    const pick = (r) => who === 'human' ? r.starsHuman : who === 'ai' ? r.starsAi : [...r.starsHuman, ...r.starsAi];
+    const resolvedOf = (r) => who === 'human' ? r.resolvedHuman : who === 'ai' ? r.resolvedAi : r.resolvedHuman + r.resolvedAi;
+    const allStars = subset.flatMap(pick);
     const n = allStars.length;
     const sum = allStars.reduce((a, b) => a + b, 0);
     const positive = allStars.filter(s => s === 5).length;
     const negative = allStars.filter(s => s === 1 || s === 2).length;
     return {
       avgStar: n > 0 ? +(sum / n).toFixed(2) : null,
-      resolvedCount: subset.reduce((s, r) => s + r.resolvedCount, 0),
+      resolvedCount: subset.reduce((acc, r) => acc + resolvedOf(r), 0),
       reviewCount: n,
       positiveRate: n > 0 ? +((positive / n) * 100).toFixed(1) : null,
       negativeRate: n > 0 ? +((negative / n) * 100).toFixed(1) : null,
     };
   }
 
+  // 연도 × 구분마다 인간 / AI / 전체 3벌.
+  function bucket(year, div) {
+    const f = (r) => r.year === year && r.div === div;
+    return { human: aggregate(f, 'human'), ai: aggregate(f, 'ai'), all: aggregate(f, 'all') };
+  }
+
   return {
     refYear, prevYear: refYear - 1,
     refPeriod: { start: refStart, end: refEnd },
     prevPeriod: { start: prevPeriod.start, end: prevPeriod.end },
-    inPerson: {
-      prev: aggregate(r => r.year === 'prev' && r.div === 'QA110001'),
-      ref:  aggregate(r => r.year === 'ref'  && r.div === 'QA110001'),
-    },
-    online: {
-      prev: aggregate(r => r.year === 'prev' && r.div === 'QA110002'),
-      ref:  aggregate(r => r.year === 'ref'  && r.div === 'QA110002'),
-    },
+    inPerson: { prev: bucket('prev', 'QA110001'), ref: bucket('ref', 'QA110001') },
+    online:   { prev: bucket('prev', 'QA110002'), ref: bucket('ref', 'QA110002') },
   };
 }
 
@@ -2327,24 +2339,42 @@ async function doRating() {
 function renderRating(d) {
   const fmt = (v, suf) => v == null ? '-' : v + (suf || '');
   const dateLabel = (year, p) => year + '년 ' + p.start.slice(5).replace('-', '/') + '~' + p.end.slice(5).replace('-', '/');
-  const row = (label, m) =>
-    '<tr><td>' + esc(label) + '</td>' +
-    '<td>' + fmt(m.avgStar) + '</td>' +
-    '<td>' + m.resolvedCount.toLocaleString() + '</td>' +
-    '<td>' + m.reviewCount.toLocaleString() + '</td>' +
-    '<td>' + fmt(m.positiveRate, '%') + '</td>' +
-    '<td>' + fmt(m.negativeRate, '%') + '</td></tr>';
+
+  // 한 줄. kind: 'human' | 'ai' | 'all'
+  const row = (label, m, kind) => {
+    const style = kind === 'all'
+      ? 'font-weight:700;background:#fafafa'
+      : (kind === 'ai' ? 'color:#4A90E2' : 'color:#D9534F');
+    const who = kind === 'all' ? '전체' : (kind === 'ai' ? 'AI TA (아이올)' : '인간 TA');
+    return '<tr style="' + style + '"><td>' + esc(label) + '</td><td>' + esc(who) + '</td>' +
+      '<td>' + fmt(m.avgStar) + '</td>' +
+      '<td>' + m.resolvedCount.toLocaleString() + '</td>' +
+      '<td>' + m.reviewCount.toLocaleString() + '</td>' +
+      '<td>' + fmt(m.positiveRate, '%') + '</td>' +
+      '<td>' + fmt(m.negativeRate, '%') + '</td></tr>';
+  };
+
+  // 해당 구분에 AI 데이터가 전혀 없으면 (대면은 AI 미지원) AI 행을 숨긴다.
+  const hasAi = (sec) => [sec.prev, sec.ref].some(b => b.ai.reviewCount > 0 || b.ai.resolvedCount > 0);
+
+  const section = (title, sec, denomLabel, reviewLabel) => {
+    const showAi = hasAi(sec);
+    let t = '<div class="section"><h2>' + title + '</h2>';
+    if (!showAi) t += '<div style="color:#888;font-size:12px;margin-bottom:6px">이 구분에는 AI TA 답변이 없어 인간 TA만 표시합니다.</div>';
+    t += '<table><thead><tr><th>기간</th><th>답변 주체</th><th>평균 별점</th><th>' + denomLabel + '</th><th>' + reviewLabel + '</th><th>긍정적 별점 비율</th><th>부정적 별점 비율</th></tr></thead><tbody>';
+    [[d.prevYear, d.prevPeriod, sec.prev], [d.refYear, d.refPeriod, sec.ref]].forEach(([y, p, b]) => {
+      const lb = dateLabel(y, p);
+      t += row(lb, b.human, 'human');
+      if (showAi) t += row(lb, b.ai, 'ai');
+      if (showAi) t += row(lb, b.all, 'all');
+    });
+    t += '</tbody></table></div>';
+    return t;
+  };
+
   let h = '';
-  h += '<div class="section"><h2>1. 대면 TA 상담</h2>';
-  h += '<table><thead><tr><th></th><th>평균 별점</th><th>상담 진행 횟수</th><th>리뷰완료 상담 수</th><th>긍정적 별점 비율</th><th>부정적 별점 비율</th></tr></thead><tbody>';
-  h += row(dateLabel(d.prevYear, d.prevPeriod), d.inPerson.prev);
-  h += row(dateLabel(d.refYear, d.refPeriod), d.inPerson.ref);
-  h += '</tbody></table></div>';
-  h += '<div class="section"><h2>2. 온라인 답변</h2>';
-  h += '<table><thead><tr><th></th><th>평균 별점</th><th>해결 완료 질문 수</th><th>리뷰완료 질문 수</th><th>긍정적 별점 비율</th><th>부정적 별점 비율</th></tr></thead><tbody>';
-  h += row(dateLabel(d.prevYear, d.prevPeriod), d.online.prev);
-  h += row(dateLabel(d.refYear, d.refPeriod), d.online.ref);
-  h += '</tbody></table></div>';
+  h += section('1. 대면 TA 상담', d.inPerson, '상담 진행 횟수', '리뷰완료 상담 수');
+  h += section('2. 온라인 답변', d.online, '해결 완료 질문 수', '리뷰완료 질문 수');
   document.getElementById('ratingResult').innerHTML = h;
 }
 
